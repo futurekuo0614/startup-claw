@@ -176,6 +176,10 @@ def batch_classify_titles(items: list[dict]) -> list[int]:
         m = re.search(r"\[[\d,\s]*\]", raw)
         if m:
             return json.loads(m.group(0))
+    except requests.Timeout:
+        # Ollama 過載時不要 fallback 全進 Stage 2，直接跳過本批
+        logger.error("Stage1 Ollama timeout — skipping batch")
+        return []
     except Exception as e:
         logger.warning("batch_classify error: %s", e)
     return list(range(len(items)))  # fallback: 全部進 Stage 2
@@ -221,7 +225,9 @@ def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) ->
         f'"summary":"{summary_ex}",'
         '"industry":["AI","SaaS"],'
         '"stage":"Pre-A","fundingAmountRaw":"數百萬美元",'
-        '"investors":["紅杉中國"],"founded":"2023","website":""}\n\n'
+        '"investors":["紅杉中國"],"founded":"2023","website":"",'
+        '"relevanceScore":8}\n\n'
+        "relevanceScore: rate 0-10 how relevant this is as an investable startup (10=clear funding/product news, 0=irrelevant).\n\n"
         "Now extract from:\n"
         f"Title: {title}\nSummary: {summary[:250]}"
     )
@@ -232,9 +238,10 @@ def call_ollama(prompt: str) -> dict | None:
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        "format": "json",   # 強制 Ollama 輸出合法 JSON，大幅減少 parse 失敗
         "options": {
             "temperature": 0.05,
-            "num_predict": 350,
+            "num_predict": 600,   # 350 容易截斷含 relevanceScore 的完整輸出
             "top_p": 0.9,
             "repeat_penalty": 1.1,
         },
@@ -382,9 +389,11 @@ def parse_response(text: str) -> dict | None:
             return _normalize_result(d) if isinstance(d, dict) else None
         except json.JSONDecodeError:
             pass
-        m = re.search(r"\{[\s\S]*?\}", clean)
-        if m:
-            d = json.loads(m.group(0))
+        # 找第一個 { 到最後一個 }，避免 non-greedy *? 遇到 nested dict 就截斷
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start != -1 and end > start:
+            d = json.loads(clean[start:end + 1])
             return _normalize_result(d) if isinstance(d, dict) else None
     except Exception:
         pass
@@ -410,20 +419,101 @@ def call_gemini(prompt: str) -> dict | None:
 
 # ── Scoring ──
 
-def calc_fit_score(s: dict) -> dict:
+def calc_ml_score(result: dict) -> tuple[float, list[str]]:
+    """
+    Feature-based ML score (0-10).
+
+    配分：
+      keyword 類別命中  0-4 pt  (每類最多 1pt，8 類上限 4pt)
+      融資金額信號      0-2 pt
+      輪次明確性        0-1 pt
+      投資人資料        0-1 pt
+      描述品質          0-1 pt
+      資料完整度        0-1 pt
+    """
     combined = " ".join([
-        s.get("description", ""),
-        " ".join(s.get("industry", [])),
-        " ".join(s.get("fitTags", [])),
-        s.get("companyName", ""),
+        result.get("description", ""),
+        result.get("summary", ""),
+        " ".join(result.get("industry", [])),
+        result.get("companyName", ""),
+        result.get("companyNameEn", ""),
     ]).lower()
-    score, tags = 0, []
+
+    score = 0.0
+    tags: list[str] = []
+
+    # 1. Keyword category match (up to 4 pts)
+    kw_score = 0.0
     for cat, keywords in FIT_KEYWORDS.items():
         hits = sum(1 for kw in keywords if kw.lower() in combined)
         if hits:
-            score += min(hits, 2)
+            kw_score += min(hits * 0.5, 1.0)
             tags.append(cat)
-    return {"fitScore": round(min(score / 2, 10) * 10) / 10, "fitTags": tags}
+    score += min(kw_score, 4.0)
+
+    # 2. Funding amount (up to 2 pts)
+    funding_usd = result.get("fundingAmountUSD") or 0
+    funding_raw = result.get("fundingAmountRaw") or ""
+    if funding_usd >= 50_000_000:
+        score += 2.0
+    elif funding_usd >= 10_000_000:
+        score += 1.5
+    elif funding_usd >= 1_000_000:
+        score += 1.0
+    elif funding_raw:
+        score += 0.5
+
+    # 3. Stage specificity (up to 1 pt)
+    stage_weights = {
+        "IPO": 1.0, "D輪": 0.9, "C輪": 0.8, "B輪": 0.7,
+        "A輪": 0.6, "Pre-A": 0.5, "天使輪": 0.4, "種子輪": 0.3,
+        "戰略投資": 0.5,
+    }
+    score += stage_weights.get(result.get("stage", ""), 0)
+
+    # 4. Investor data (up to 1 pt)
+    investors = result.get("investors") or []
+    if len(investors) >= 3:
+        score += 1.0
+    elif len(investors) >= 1:
+        score += 0.5
+
+    # 5. Description quality (up to 1 pt)
+    desc = result.get("description") or ""
+    if len(desc) >= 80:
+        score += 1.0
+    elif len(desc) >= 40:
+        score += 0.5
+
+    return min(round(score, 1), 10.0), tags
+
+
+def calc_fit_score(result: dict) -> dict:
+    """
+    Hybrid score = 70% ML feature score + 30% Qwen semantic score.
+    若 Qwen 未回傳 relevanceScore（舊文章、parse 失敗），則 100% 用 ML score。
+    """
+    ml_score, tags = calc_ml_score(result)
+
+    qwen_score: float | None = None
+    try:
+        raw = result.get("relevanceScore")
+        if raw is not None:
+            qwen_score = max(0.0, min(10.0, float(raw)))
+    except (TypeError, ValueError):
+        pass
+
+    if qwen_score is not None:
+        final = round(0.7 * ml_score + 0.3 * qwen_score, 1)
+    else:
+        final = ml_score
+
+    return {
+        "fitScore": final,
+        "fitTags": tags,
+        "mlScore": ml_score,
+        "qwenScore": qwen_score,
+    }
 
 
 def normalize_funding(raw: str) -> int:
@@ -469,7 +559,7 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
     if not unprocessed:
         return {"saved": 0, "remaining": 0}
 
-    region_limit = max(MAX_GEMINI_PER_RUN, 20) if region == "台灣" else MAX_GEMINI_PER_RUN
+    region_limit = 30 if region == "台灣" else MAX_GEMINI_PER_RUN
     batch = unprocessed[:region_limit]
     col_ref = today_collection()
 
@@ -502,11 +592,12 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
         region, len(to_skip), len(to_extract), len(to_classify)
     )
 
-    # 跳過的直接標 processed
+    # 跳過的直接標 processed（batch update 減少 Sheets API 呼叫數）
     if to_skip:
-        skip_rows = [[item["row"], "true"] for item in to_skip]
-        for item in to_skip:
-            ws.update_cell(item["row"], 7, "true")
+        ws.batch_update([
+            {"range": f"G{item['row']}", "values": [["true"]]}
+            for item in to_skip
+        ])
         logger.info("   ⏭️  Rule-skip: %d articles", len(to_skip))
         time.sleep(1)
 
@@ -565,8 +656,11 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
                 result["status"]           = "new"
                 result["fundingAmountUSD"] = normalize_funding(result.get("fundingAmountRaw", ""))
                 fd = calc_fit_score(result)
-                result["fitScore"] = fd["fitScore"]
-                result["fitTags"]  = fd["fitTags"]
+                result["fitScore"]  = fd["fitScore"]
+                result["fitTags"]   = fd["fitTags"]
+                result["mlScore"]   = fd["mlScore"]
+                if fd["qwenScore"] is not None:
+                    result["qwenScore"] = fd["qwenScore"]
                 firestore_write(col_ref, result)
                 saved += 1
                 logger.info("   ✅ %s [score:%s]", company, result["fitScore"])
