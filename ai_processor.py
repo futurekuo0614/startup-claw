@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import time
@@ -177,9 +178,10 @@ def batch_classify_titles(items: list[dict]) -> list[int]:
         if m:
             return json.loads(m.group(0))
     except requests.Timeout:
-        # Ollama 過載時不要 fallback 全進 Stage 2，直接跳過本批
-        logger.error("Stage1 Ollama timeout — skipping batch")
-        return []
+        # On timeout, treat all items as accepted (same conservative fallback as other exceptions).
+        # Returning [] would silently mark all items as processed with nothing written to Firebase.
+        logger.error("Stage1 Ollama timeout — fallback: treating all %d as startup", len(items))
+        return list(range(len(items)))
     except Exception as e:
         logger.warning("batch_classify error: %s", e)
     return list(range(len(items)))  # fallback: 全部進 Stage 2
@@ -202,7 +204,6 @@ def _is_valid_company_name(name: str) -> bool:
 
 
 def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) -> str:
-    tw_hint = "Taiwan media: be generous, accept any tech/startup/innovation.\n" if any(d in url for d in TAIWAN_DOMAINS) else ""
     hints = []
     if prefilled.get("stage"):
         hints.append(f"Funding stage: {prefilled['stage']}")
@@ -210,14 +211,12 @@ def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) ->
         hints.append(f"Funding amount: {prefilled['fundingAmountRaw']}")
     hint_text = ("Known info: " + ", ".join(hints) + "\n") if hints else ""
 
-    # 根據標題語言決定 summary 語言要求
     is_chinese = any("一" <= c <= "鿿" for c in title)
-    summary_ex = "公司本週完成Pre-A融資，專注AI數位員工平台" if is_chinese else "company raised $5B for defense AI systems"
+    summary_ex = "公司本週完成Pre-A融資，專注AI數位員工平台" if is_chinese else "company raised $5M for enterprise AI platform"
 
-    # 用具體示範值避免 Qwen 抄佔位符
     return (
-        f"{tw_hint}{hint_text}"
-        "Extract the main company from this article. Output JSON only (no markdown, no explanation).\n"
+        f"{hint_text}"
+        "Extract the main company from this startup/tech article. Output JSON only (no markdown, no explanation).\n"
         "If you cannot identify a specific real company name, output: {}\n\n"
         "Example output:\n"
         '{"companyName":"未來式智能","companyNameEn":"MindOS",'
@@ -226,11 +225,33 @@ def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) ->
         '"industry":["AI","SaaS"],'
         '"stage":"Pre-A","fundingAmountRaw":"數百萬美元",'
         '"investors":["紅杉中國"],"founded":"2023","website":"",'
-        '"relevanceScore":8}\n\n'
-        "relevanceScore: rate 0-10 how relevant this is as an investable startup (10=clear funding/product news, 0=irrelevant).\n\n"
+        '"relevanceScore":7}\n\n'
+        "relevanceScore scale (0-10):\n"
+        "  9-10: confirmed funding round with amount and investors named\n"
+        "  7-8:  confirmed funding round or product launch, some details\n"
+        "  5-6:  startup mentioned but funding/product unclear\n"
+        "  3-4:  tangentially related (industry report, large corp with startup angle)\n"
+        "  0-2:  irrelevant (macro, stock market, policy, large public corp)\n\n"
         "Now extract from:\n"
         f"Title: {title}\nSummary: {summary[:250]}"
     )
+
+
+def _call_ollama_with_retry(prompt: str, max_retries: int = 3) -> dict | None:
+    """call_ollama with exponential backoff on Timeout."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return call_ollama(prompt)
+        except requests.Timeout:
+            wait = 2 ** attempt
+            logger.warning("Ollama timeout (attempt %d/%d) — retry in %ds", attempt, max_retries, wait)
+            if attempt < max_retries:
+                time.sleep(wait)
+        except Exception as e:
+            logger.error("Ollama error: %s", e)
+            return None
+    logger.error("Ollama failed after %d retries", max_retries)
+    return None
 
 
 def call_ollama(prompt: str) -> dict | None:
@@ -522,11 +543,12 @@ def normalize_funding(raw: str) -> int:
     t = raw.lower()
     m = re.search(r"[\d.]+", t)
     n = float(m.group(0)) if m else 0
-    if "億" in t or "亿" in t:    n *= 100_000_000
-    elif "千萬" in t:              n *= 10_000_000
-    elif "萬" in t or "万" in t:  n *= 10_000
-    elif "m" in t or "百萬" in t: n *= 1_000_000
-    elif "k" in t or "千" in t:   n *= 1_000
+    if "億" in t or "亿" in t:                     n *= 100_000_000
+    elif "千萬" in t:                               n *= 10_000_000
+    elif "萬" in t or "万" in t:                   n *= 10_000
+    elif "billion" in t or re.search(r"\db\b", t): n *= 1_000_000_000
+    elif "m" in t or "百萬" in t:                  n *= 1_000_000
+    elif "k" in t or "千" in t:                    n *= 1_000
     if "twd" in t or "台幣" in t:      n /= FX["TWD"]
     elif "cny" in t or "人民幣" in t:  n /= FX["CNY"]
     elif "sgd" in t:                   n /= FX["SGD"]
@@ -535,6 +557,16 @@ def normalize_funding(raw: str) -> int:
 
 def today_collection() -> str:
     return "startups_" + datetime.now().strftime("%Y-%m-%d")
+
+
+def collection_for_tab(tab_name: str) -> str:
+    """Derive Firebase collection name from the Sheets tab name.
+    'raw_2026-05-20' → 'startups_2026-05-20'
+    Falls back to today if tab_name has no date suffix.
+    """
+    if tab_name and tab_name.startswith("raw_"):
+        return "startups_" + tab_name[4:]
+    return today_collection()
 
 
 # ── Main processor（三階段流程） ──
@@ -561,7 +593,7 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
 
     region_limit = 30 if region == "台灣" else MAX_GEMINI_PER_RUN
     batch = unprocessed[:region_limit]
-    col_ref = today_collection()
+    col_ref = collection_for_tab(tab_name)  # Bug1 fix: derive from tab_name, not today's date
 
     # ── Stage 0：規則分類 ──
     to_skip, to_extract, to_classify = [], [], []
@@ -625,7 +657,7 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
 
     # ── Stage 2：個別提取 ──
     logger.info("Stage2: extract fields for %d confirmed startups", len(to_extract))
-    saved = skipped = 0
+    saved = skipped = errors = 0
 
     for j, item in enumerate(to_extract):
         row_data = item["data"]
@@ -635,13 +667,28 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
         summary  = item["summary"]
         prefilled = item["prefilled"]
 
+        # Input validation: skip rows with no URL (scraper output integrity check)
+        if not url:
+            logger.warning("   ⚠️  Row %d has no URL — marking skipped", item["row"])
+            ws.update_cell(item["row"], 7, "skipped")
+            skipped += 1
+            continue
+
         try:
             logger.info("🔍 [%d/%d] %s", j + 1, len(to_extract), title[:60])
             prompt = build_extract_prompt(title, summary, url, prefilled)
-            result = call_ollama(prompt)
+            result = _call_ollama_with_retry(prompt)  # retry wrapper with backoff
 
-            company = result.get("companyName", "") if result else ""
-            if result and _is_valid_company_name(company):
+            if result is None:
+                # Ollama returned unparseable response after retries — flag for investigation
+                logger.warning("   ⚠️  Ollama parse failure for: %s", title[:60])
+                ws.update_cell(item["row"], 7, "error")  # Bug3 fix: "error" not "true"
+                errors += 1
+                time.sleep(2)
+                continue
+
+            company = result.get("companyName", "")
+            if _is_valid_company_name(company):
                 # 補回 prefilled 欄位（Qwen 可能漏掉）
                 if not result.get("stage") and prefilled.get("stage"):
                     result["stage"] = prefilled["stage"]
@@ -656,27 +703,43 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
                 result["status"]           = "new"
                 result["fundingAmountUSD"] = normalize_funding(result.get("fundingAmountRaw", ""))
                 fd = calc_fit_score(result)
-                result["fitScore"]  = fd["fitScore"]
-                result["fitTags"]   = fd["fitTags"]
-                result["mlScore"]   = fd["mlScore"]
-                if fd["qwenScore"] is not None:
-                    result["qwenScore"] = fd["qwenScore"]
-                firestore_write(col_ref, result)
-                saved += 1
-                logger.info("   ✅ %s [score:%s]", company, result["fitScore"])
-            else:
-                skipped += 1
-                reason = f"placeholder name: '{company}'" if company else "no companyName / empty result"
-                logger.info("   ⚠️  Skip: %s", reason)
 
-            ws.update_cell(item["row"], 7, "true")
+                # Bug5 fix: validate score ranges before Firebase write
+                fit = max(0.0, min(10.0, fd["fitScore"]))
+                ml  = max(0.0, min(10.0, fd["mlScore"]))
+                if fit != fd["fitScore"] or ml != fd["mlScore"]:
+                    logger.warning("Score out of range clamped: fit=%.1f ml=%.1f", fd["fitScore"], fd["mlScore"])
+
+                result["fitScore"]  = fit
+                result["fitTags"]   = fd["fitTags"]
+                result["mlScore"]   = ml
+                if fd["qwenScore"] is not None:
+                    result["qwenScore"] = max(0.0, min(10.0, fd["qwenScore"]))
+
+                # Idempotent write: URL hash as doc_id prevents duplicates on re-run
+                doc_id = hashlib.md5(url.encode()).hexdigest()[:16]
+                firestore_write(col_ref, result, doc_id=doc_id)
+                ws.update_cell(item["row"], 7, "true")
+                saved += 1
+                logger.info("   ✅ %s [score:%.1f]", company, result["fitScore"])
+            else:
+                # Valid JSON from Qwen but no identifiable company — expected for non-startups
+                reason = f"placeholder name: '{company}'" if company else "no companyName"
+                logger.info("   ⚠️  Skip: %s", reason)
+                ws.update_cell(item["row"], 7, "skipped")  # Bug3 fix: "skipped" not "true"
+                skipped += 1
+
             time.sleep(3)
 
         except Exception as e:
-            logger.error("   ❌ %s", e)
+            logger.error("   ❌ row %d: %s", item["row"], e)
             ws.update_cell(item["row"], 7, "error")
+            errors += 1
             time.sleep(2)
 
     remaining = max(0, len(unprocessed) - region_limit)
-    logger.info("📊 [%s] saved=%d skipped=%d remaining=%d", region, saved, skipped, remaining)
-    return {"saved": saved, "remaining": remaining}
+    logger.info("📊 [%s] saved=%d skipped=%d errors=%d remaining=%d",
+                region, saved, skipped, errors, remaining)
+    if errors:
+        logger.error("⚠️  %d rows marked 'error' in [%s] — review and retry manually", errors, region)
+    return {"saved": saved, "remaining": remaining, "errors": errors}

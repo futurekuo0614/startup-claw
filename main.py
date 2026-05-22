@@ -3,6 +3,8 @@ import logging
 import datetime
 from scraper import run_all_scrapers
 from ai_processor import process_raw_articles_by_region, get_sheet
+from weekly_report import load_all_tabs, analyze_rows, render_html
+from email_sender import send_weekly_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -22,32 +24,74 @@ def step2_ai(tab_name=None):
     logger.info("Step2 START (AI+Firebase)")
     if tab_name is None:
         tab_name = "raw_" + datetime.datetime.now().strftime("%Y-%m-%d")
+    total_saved = total_errors = 0
+    failed_regions = []
     for region in REGIONS:
         try:
             logger.info("Processing region: %s", region)
-            process_raw_articles_by_region(region, tab_name)
+            result = process_raw_articles_by_region(region, tab_name)
+            total_saved  += result.get("saved", 0)
+            total_errors += result.get("errors", 0)
         except Exception as e:
-            logger.error("region %s error: %s", region, e)
+            logger.error("region %s FAILED: %s", region, e)
+            failed_regions.append(region)
     duration = (datetime.datetime.now() - start).total_seconds()
-    logger.info("Step2 DONE: %.1fs", duration)
+    logger.info("Step2 DONE: %.1fs | saved=%d errors=%d", duration, total_saved, total_errors)
+    if failed_regions or total_errors:
+        logger.error("⚠️  Step2 had failures — regions_failed=%s row_errors=%d",
+                     failed_regions, total_errors)
 
-def daily_run():
+def step3_report(tab_name: str | None = None, send_email: bool = False):
+    start = datetime.datetime.now()
+    logger.info("Step3 START (weekly report)")
+    try:
+        rows = load_all_tabs()
+        if not rows and tab_name:
+            from weekly_report import load_single_tab
+            rows = load_single_tab(tab_name)
+    except Exception as e:
+        logger.error("Step3 load error: %s", e)
+        rows = []
+
+    if not rows:
+        logger.warning("Step3: no rows found — skipping report")
+        return
+
+    stats = analyze_rows(rows)
+    html = render_html(tab_name or "all_tabs", rows, stats)
+
+    if send_email:
+        ok = send_weekly_report(html)
+        if not ok:
+            logger.error("Step3: email failed — report saved to local file")
+    else:
+        filename = f"weekly_report_{datetime.date.today()}.html"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.info("Step3: report saved to %s (use --email to send)", filename)
+
+    duration = (datetime.datetime.now() - start).total_seconds()
+    logger.info("Step3 DONE: %.1fs", duration)
+
+
+def daily_run(send_email: bool = False):
     start = datetime.datetime.now()
     logger.info("dailyRun START: %s", start.isoformat())
-    # Step 1: Scraper -> Google Sheets only
     tab_name = step1_scrape()
     logger.info("--- Step 1 done, tab: %s ---", tab_name)
-    # Step 2: AI -> Firebase (can be run separately)
     step2_ai(tab_name)
+    step3_report(tab_name, send_email=send_email)
     duration = (datetime.datetime.now() - start).total_seconds()
     logger.info("dailyRun DONE: %.1fs", duration)
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
-    tab = sys.argv[2] if len(sys.argv) > 2 else None
+    tab  = sys.argv[2] if len(sys.argv) > 2 else None
     if mode == "--step1":
         step1_scrape(tab)
     elif mode == "--step2":
         step2_ai(tab)
+    elif mode == "--step3":
+        step3_report(tab, send_email="--email" in sys.argv)
     else:
-        daily_run()
+        daily_run(send_email="--email" in sys.argv)

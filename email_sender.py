@@ -1,0 +1,109 @@
+"""
+Weekly report email sender.
+Reads config from env vars: EMAIL_SENDER, EMAIL_PASSWORD, REPORT_RECIPIENTS (comma-separated).
+Falls back to writing an HTML file if SMTP fails after MAX_RETRIES attempts.
+"""
+import logging
+import os
+import smtplib
+import time
+from datetime import date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+MAX_RETRIES = 3
+
+EMAIL_SENDER     = os.environ.get("EMAIL_SENDER", "")
+EMAIL_PASSWORD   = os.environ.get("EMAIL_PASSWORD", "")
+REPORT_RECIPIENTS = [
+    r.strip() for r in os.environ.get("REPORT_RECIPIENTS", "").split(",") if r.strip()
+]
+
+
+def _is_configured() -> bool:
+    return bool(EMAIL_SENDER and EMAIL_PASSWORD and REPORT_RECIPIENTS)
+
+
+def _save_fallback(html_content: str) -> str:
+    filename = f"weekly_report_{date.today()}.html"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    logger.info("📄 Report saved to file as fallback: %s", filename)
+    return filename
+
+
+def send_weekly_report(html_content: str, subject: str | None = None) -> bool:
+    """
+    Send the weekly report via Gmail SMTP.
+
+    Returns True if sent successfully.
+    Returns False and saves HTML to local file if all retries fail or credentials missing.
+    """
+    if not _is_configured():
+        logger.error(
+            "Email not configured. Set EMAIL_SENDER, EMAIL_PASSWORD, "
+            "REPORT_RECIPIENTS in .env. Saving report to local file."
+        )
+        _save_fallback(html_content)
+        return False
+
+    if subject is None:
+        subject = f"新創情報周報 — {date.today().strftime('%Y-%m-%d')}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = ", ".join(REPORT_RECIPIENTS)
+    msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                smtp.sendmail(EMAIL_SENDER, REPORT_RECIPIENTS, msg.as_string())
+            logger.info("✅ Email sent to: %s", ", ".join(REPORT_RECIPIENTS))
+            return True
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error("SMTP authentication failed (check EMAIL_PASSWORD): %s", e)
+            last_error = e
+            break  # auth failure is not retryable
+        except Exception as e:
+            last_error = e
+            wait = 2 ** attempt
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    "Email attempt %d/%d failed: %s — retrying in %ds",
+                    attempt, MAX_RETRIES, e, wait
+                )
+                time.sleep(wait)
+            else:
+                logger.error("Email attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
+
+    logger.error("❌ All %d email attempts failed. Last error: %s", MAX_RETRIES, last_error)
+    _save_fallback(html_content)
+    return False
+
+
+def dry_run(html_content: str) -> None:
+    """Log what would be sent without actually sending."""
+    if not _is_configured():
+        logger.info("[dry-run] Email not configured — would save to local file.")
+        return
+    logger.info(
+        "[dry-run] Would send '%s' from %s to: %s (%d bytes)",
+        f"新創情報周報 — {date.today()}",
+        EMAIL_SENDER,
+        ", ".join(REPORT_RECIPIENTS),
+        len(html_content),
+    )

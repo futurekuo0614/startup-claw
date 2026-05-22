@@ -3,10 +3,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY       = os.environ["GEMINI_API_KEY"]
-FIREBASE_PROJECT_ID  = os.environ["FIREBASE_PROJECT_ID"]
-SHEETS_ID            = os.environ["SHEETS_ID"]
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")  # Service Account JSON 字串
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        raise EnvironmentError(
+            f"Required environment variable '{name}' is not set. "
+            "Add it to your .env file and restart."
+        )
+    return val
+
+
+GEMINI_API_KEY          = os.environ.get("GEMINI_API_KEY", "")   # optional: Gemini fallback LLM
+FIREBASE_PROJECT_ID     = _require_env("FIREBASE_PROJECT_ID")
+SHEETS_ID               = _require_env("SHEETS_ID")
+GOOGLE_CREDENTIALS_JSON = _require_env("GOOGLE_CREDENTIALS_JSON")
 
 FIRESTORE_BASE = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents"
 

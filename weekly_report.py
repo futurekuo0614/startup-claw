@@ -7,6 +7,7 @@ Usage:
     python weekly_report.py --html            # 同時輸出 HTML
 """
 import sys
+import html as _html
 import json
 import re
 import datetime
@@ -144,7 +145,8 @@ def parse_funding_from_title(title: str) -> str:
 
 def guess_stage_from_title(title: str) -> str:
     stage_map = {
-        "種子輪": ["種子輪", "seed", "天使輪", "angel"],
+        "種子輪": ["種子輪", "seed"],
+        "天使輪": ["天使輪", "angel"],  # Bug8 fix: was incorrectly grouped under 種子輪
         "Pre-A": ["pre-a", "prea", "pre a"],
         "A輪": ["a輪", "series a", "a round"],
         "B輪": ["b輪", "series b", "b round"],
@@ -506,12 +508,16 @@ def render_html(tab_name: str, rows: list[dict], stats: dict) -> str:
         rows_html = ""
         for i, item in enumerate(stats["funding_articles"], 1):
             emoji = REGION_EMOJI.get(item["region"], "")
-            stage_badge = f"<span class='badge badge-blue'>{item['stage']}</span>" if item["stage"] else "-"
+            safe_title   = _html.escape(item["title"])
+            safe_url     = _html.escape(item["url"])
+            safe_funding = _html.escape(item["funding"])
+            safe_stage   = _html.escape(item["stage"])
+            stage_badge = f"<span class='badge badge-blue'>{safe_stage}</span>" if item["stage"] else "-"
             rows_html += (
                 f"<tr><td class='idx'>{i}</td>"
-                f"<td><a href='{item['url']}' target='_blank'>{item['title']}</a></td>"
-                f"<td><span class='badge badge-green'>{item['funding']}</span></td>"
-                f"<td>{emoji} {item['region']}</td>"
+                f"<td><a href='{safe_url}' target='_blank'>{safe_title}</a></td>"
+                f"<td><span class='badge badge-green'>{safe_funding}</span></td>"
+                f"<td>{emoji} {_html.escape(item['region'])}</td>"
                 f"<td>{stage_badge}</td></tr>"
             )
         funding_section = (
@@ -523,7 +529,10 @@ def render_html(tab_name: str, rows: list[dict], stats: dict) -> str:
     notable_items = ""
     for i, item in enumerate(stats["notable"], 1):
         emoji = REGION_EMOJI.get(item["region"], "🌐")
-        link = f"<a href='{item['url']}' target='_blank'>{item['title']}</a>" if item["url"] else item["title"]
+        safe_title = _html.escape(item["title"])
+        safe_url   = _html.escape(item["url"])
+        # Bug4 fix: escape user-generated content before inserting into HTML
+        link = f"<a href='{safe_url}' target='_blank'>{safe_title}</a>" if item["url"] else safe_title
         notable_items += f"<li><span class='idx'>{i}</span><span>{emoji} {link}</span></li>"
 
     source_rows = ""
@@ -557,7 +566,9 @@ def render_html(tab_name: str, rows: list[dict], stats: dict) -> str:
 
 def main():
     args = sys.argv[1:]
-    output_html = "--html" in args
+    output_html  = "--html"  in args
+    send_email   = "--email" in args
+    dry_email    = "--dry-email" in args
     args = [a for a in args if not a.startswith("--")]
 
     if args:
@@ -581,12 +592,27 @@ def main():
     stats = analyze_rows(rows)
     render_terminal(tab_name, rows, stats)
 
-    if output_html:
+    if output_html or send_email or dry_email:
         html = render_html(tab_name, rows, stats)
+
+    if output_html:
         filename = f"weekly_report_{datetime.date.today()}.html"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(html)
         console.print(f"[bright_green]✅ HTML 報告已儲存: {filename}[/]")
+
+    if send_email:
+        from email_sender import send_weekly_report
+        ok = send_weekly_report(html)
+        if ok:
+            console.print("[bright_green]✅ 周報已寄出[/]")
+        else:
+            console.print("[yellow]⚠️  Email 失敗，已存成本地 HTML 備份[/]")
+
+    if dry_email:
+        from email_sender import dry_run
+        dry_run(html)
+        console.print("[grey50][dry-run] Email 模擬完成[/]")
 
 
 if __name__ == "__main__":
