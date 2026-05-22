@@ -9,11 +9,14 @@ Usage:
 import sys
 import html as _html
 import json
+import logging
 import re
 import datetime
 from collections import Counter, defaultdict
 from ai_processor import get_sheet
 from config import SOURCES
+
+logger = logging.getLogger(__name__)
 
 from rich.console import Console
 from rich.table import Table
@@ -102,15 +105,23 @@ def load_single_tab(tab_name: str) -> list[dict]:
     return rows
 
 
-def load_hotai_top(collection: str, limit: int = 10) -> list[dict]:
-    """從 Firebase 讀取本週 hotaiFitScore 最高的新創，用於報告排行榜。"""
+def load_scored_map(collection: str) -> dict:
+    """從 Firebase 讀取本週所有已評分文章，以 sourceUrl 為 key。
+    用於在報告中逐篇顯示和泰適配度評分。"""
     try:
-        from firebase_client import firestore_query
-        docs = firestore_query(collection, order_by="hotaiFitScore", limit=limit)
-        return [d for d in docs if d.get("hotaiFitScore") is not None]
+        from firebase_client import get_db
+        db = get_db()
+        result = {}
+        for doc in db.collection(collection).stream():
+            d = doc.to_dict()
+            url = d.get("sourceUrl", "")
+            if url:
+                result[url] = d
+        logger.info("load_scored_map: %d scored docs from %s", len(result), collection)
+        return result
     except Exception as e:
-        logger.warning("load_hotai_top failed: %s", e)
-        return []
+        logger.warning("load_scored_map failed: %s", e)
+        return {}
 
 
 # ── Article title analysis (no AI needed) ──
@@ -427,262 +438,289 @@ def render_terminal(tab_name: str, rows: list[dict], stats: dict):
 
 # ── HTML renderer ──
 
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="X-UA-Compatible" content="IE=edge">
-<title>新創情報周報 {week}</title>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;800&display=swap" rel="stylesheet">
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: #ffffff; color: #1a1a2e; font-family: 'Noto Sans TC', 'Microsoft JhengHei', Arial, sans-serif; padding: 0; margin: 0; }}
-  .outer {{ background: #f4f6fb; padding: 24px 0; }}
-  .container {{ max-width: 900px; margin: 0 auto; background: #ffffff; border: 1px solid #dde3ee; border-radius: 8px; overflow: hidden; }}
-  /* Header */
-  .header {{ background: #1a3a6e; color: #ffffff; padding: 32px 32px 24px; text-align: center; }}
-  .header h1 {{ font-size: 1.8rem; font-weight: 800; color: #ffffff; margin-bottom: 6px; letter-spacing: .04em; }}
-  .header .meta {{ color: #a8c4f0; font-size: 0.88rem; letter-spacing: .05em; }}
-  /* Summary cards — table-based for Outlook */
-  .cards-table {{ width: 100%; border-collapse: collapse; background: #f0f4fc; }}
-  .cards-table td {{ padding: 18px 0; text-align: center; border-right: 1px solid #dde3ee; width: 25%; }}
-  .cards-table td:last-child {{ border-right: none; }}
-  .card-num {{ font-size: 2rem; font-weight: 800; }}
-  .card-label {{ color: #5a6a8a; font-size: 0.78rem; margin-top: 2px; }}
-  /* Sections */
-  .section {{ padding: 20px 28px; border-bottom: 1px solid #eef0f6; }}
-  .section:last-child {{ border-bottom: none; }}
-  .section-title {{ font-size: 0.95rem; font-weight: 700; color: #1a3a6e; margin-bottom: 14px;
-    padding-bottom: 8px; border-bottom: 2px solid #1a3a6e; text-transform: uppercase; letter-spacing: .06em; }}
-  /* Tables */
-  table.data-table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
-  table.data-table th {{ background: #eef2fb; color: #3a4a6a; padding: 8px 12px; text-align: left;
-    font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .05em;
-    border-bottom: 2px solid #c8d4ec; }}
-  table.data-table td {{ padding: 9px 12px; border-bottom: 1px solid #eef0f6; vertical-align: top; color: #1a1a2e; }}
-  table.data-table tr:last-child td {{ border-bottom: none; }}
-  table.data-table tr:nth-child(even) td {{ background: #f8faff; }}
-  /* Bar */
-  .bar-wrap {{ background: #dde3ee; border-radius: 4px; height: 7px; overflow: hidden; min-width: 80px; }}
-  .bar-fill {{ height: 100%; border-radius: 4px; background: #2d7dd2; }}
-  .bar-fill-hotai {{ background: #e07b00; }}
-  /* Badges */
-  .badge {{ display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.75rem; font-weight: 700; }}
-  .badge-green {{ background: #d4f4e2; color: #1a7a3e; }}
-  .badge-blue  {{ background: #ddeeff; color: #1a4a8e; }}
-  .badge-orange {{ background: #fdebd0; color: #a05000; }}
-  .badge-red   {{ background: #fde8e8; color: #9a1a1a; }}
-  /* Notable list */
-  .notable-list {{ list-style: none; font-size: 0.88rem; }}
-  .notable-list li {{ padding: 9px 0; border-bottom: 1px solid #eef0f6; display: flex; gap: 10px; align-items: flex-start; }}
-  .notable-list li:last-child {{ border-bottom: none; }}
-  .notable-list a {{ color: #1a5cb5; text-decoration: underline; }}
-  .notable-list a:hover {{ color: #0d3d7a; }}
-  .idx {{ color: #8a9ab5; font-size: 0.8rem; min-width: 20px; text-align: right; padding-top: 1px; }}
-  /* Hotai section highlight */
-  .hotai-header {{ background: #fff8ee; border-left: 4px solid #e07b00; padding: 10px 14px; margin-bottom: 14px; font-size: 0.82rem; color: #7a4800; border-radius: 0 4px 4px 0; }}
-  /* Footer */
-  .footer {{ background: #f0f4fc; text-align: center; color: #7a8aaa; font-size: 0.78rem; padding: 16px; border-top: 1px solid #dde3ee; }}
-  a {{ color: #1a5cb5; }}
-  @media print {{
-    body, .outer {{ background: #ffffff; }}
-    .container {{ border: none; box-shadow: none; }}
-  }}
-</style>
-</head>
-<body>
-<div class="outer">
-<div class="container">
-  <div class="header">
-    <h1>新創情報周報</h1>
-    <div class="meta">{week} &nbsp;·&nbsp; {date} &nbsp;·&nbsp; {tab}</div>
-  </div>
+_HTML_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #ffffff; color: #1a1a2e; font-family: 'Noto Sans TC', 'Microsoft JhengHei', Arial, sans-serif; font-size: 13px; }
+.page { padding: 28px 32px; background: #ffffff; }
+.region-page { page-break-before: always; padding: 28px 32px; }
+/* Header */
+.report-header { background: #1a3a6e; color: #ffffff; padding: 20px 24px; border-radius: 6px; margin-bottom: 20px; }
+.report-header h1 { font-size: 1.4rem; font-weight: 800; color: #ffffff; margin-bottom: 4px; }
+.report-header .meta { color: #a8c4f0; font-size: 0.82rem; }
+.region-header { background: #1a3a6e; color: #ffffff; padding: 14px 20px; border-radius: 6px; margin-bottom: 16px; }
+.region-header h2 { font-size: 1.1rem; font-weight: 700; color: #ffffff; }
+.region-header .sub { color: #a8c4f0; font-size: 0.8rem; margin-top: 2px; }
+/* Stat cards */
+.cards-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; border: 1px solid #dde3ee; border-radius: 6px; overflow: hidden; }
+.cards-table td { padding: 14px 0; text-align: center; border-right: 1px solid #dde3ee; background: #f0f4fc; }
+.cards-table td:last-child { border-right: none; }
+.card-num { font-size: 1.8rem; font-weight: 800; }
+.card-label { color: #5a6a8a; font-size: 0.75rem; margin-top: 2px; }
+/* Section */
+.section { margin-bottom: 20px; }
+.section-title { font-size: 0.85rem; font-weight: 700; color: #1a3a6e; margin-bottom: 10px;
+  padding-bottom: 6px; border-bottom: 2px solid #1a3a6e; text-transform: uppercase; letter-spacing: .06em; }
+/* Tables */
+table.dt { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+table.dt th { background: #eef2fb; color: #3a4a6a; padding: 7px 10px; text-align: left;
+  font-weight: 700; font-size: 0.75rem; border-bottom: 2px solid #c8d4ec; }
+table.dt td { padding: 7px 10px; border-bottom: 1px solid #eef0f6; vertical-align: top; }
+table.dt tr:last-child td { border-bottom: none; }
+table.dt tr:nth-child(even) td { background: #f8faff; }
+/* Score badges */
+.score-hi  { display: inline-block; background: #fff0dc; color: #a05000; font-weight: 700;
+  padding: 2px 8px; border-radius: 4px; font-size: 0.82rem; border: 1px solid #f5c67a; }
+.score-mid { display: inline-block; background: #ddeeff; color: #1a4a8e; font-weight: 700;
+  padding: 2px 8px; border-radius: 4px; font-size: 0.82rem; border: 1px solid #9bc0f0; }
+.score-lo  { display: inline-block; color: #8a9ab5; font-size: 0.82rem; }
+.score-na  { color: #b0bac8; font-size: 0.82rem; }
+/* Badges */
+.badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.72rem; font-weight: 700; }
+.badge-green  { background: #d4f4e2; color: #1a7a3e; }
+.badge-blue   { background: #ddeeff; color: #1a4a8e; }
+.badge-orange { background: #fdebd0; color: #a05000; }
+/* Bar */
+.bar-wrap { background: #dde3ee; border-radius: 3px; height: 6px; min-width: 60px; overflow: hidden; }
+.bar-fill  { height: 6px; border-radius: 3px; background: #2d7dd2; }
+/* Notable list */
+.notable-list { list-style: none; }
+.notable-list li { padding: 7px 0; border-bottom: 1px solid #eef0f6; }
+.notable-list li:last-child { border-bottom: none; }
+.notable-list a { color: #1a5cb5; text-decoration: underline; }
+.idx { color: #8a9ab5; font-size: 0.78rem; }
+/* Footer */
+.footer { text-align: center; color: #8a9ab5; font-size: 0.75rem; margin-top: 20px;
+  padding-top: 12px; border-top: 1px solid #dde3ee; }
+/* Hotai callout box */
+.hotai-note { background: #fff8ee; border-left: 4px solid #e07b00; padding: 8px 12px;
+  margin-bottom: 12px; font-size: 0.78rem; color: #7a4800; border-radius: 0 4px 4px 0; }
+a { color: #1a5cb5; }
+@media print { body { background: #ffffff; } .region-page { page-break-before: always; } }
+"""
 
-  <table class="cards-table">
-    <tr>
-      <td><div class="card-num" style="color:#1a5cb5">{total}</div><div class="card-label">總文章數</div></td>
-      <td><div class="card-num" style="color:#1a7a3e">{processed}</div><div class="card-label">AI 已分析</div></td>
-      <td><div class="card-num" style="color:#a05000">{funding_cnt}</div><div class="card-label">融資新聞</div></td>
-      <td><div class="card-num" style="color:#6a1a8e">{notable_cnt}</div><div class="card-label">重點新聞</div></td>
-    </tr>
-  </table>
-
-  <div class="section">
-    <div class="section-title">地區分佈</div>
-    <table class="data-table">
-      <thead><tr><th>地區</th><th>文章數</th><th>佔比</th><th>文章量</th></tr></thead>
-      <tbody>{region_rows}</tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <div class="section-title">產業熱度</div>
-    <table class="data-table">
-      <thead><tr><th>產業</th><th>熱度</th><th>文章數</th></tr></thead>
-      <tbody>{industry_rows}</tbody>
-    </table>
-  </div>
-
-  {funding_section}
-
-  {hotai_section}
-
-  <div class="section">
-    <div class="section-title">本週重點新聞</div>
-    <ul class="notable-list">{notable_items}</ul>
-  </div>
-
-  <div class="section">
-    <div class="section-title">來源活躍度</div>
-    <table class="data-table">
-      <thead><tr><th>媒體</th><th>文章數</th></tr></thead>
-      <tbody>{source_rows}</tbody>
-    </table>
-  </div>
-
-  <div class="footer">報告產生時間: {generated_at} &nbsp;·&nbsp; Powered by Qwen 2.5 + Claude</div>
-</div>
-</div>
-</body>
-</html>"""
+_REGION_ORDER = ["台灣", "東南亞", "中國", "全球"]
 
 
-def render_html(tab_name: str, rows: list[dict], stats: dict) -> str:
-    today = datetime.date.today()
+def _score_badge(v: float | None) -> str:
+    if v is None:
+        return "<span class='score-na'>-</span>"
+    if v >= 7:
+        return f"<span class='score-hi'>{v:.1f}</span>"
+    if v >= 4:
+        return f"<span class='score-mid'>{v:.1f}</span>"
+    return f"<span class='score-lo'>{v:.1f}</span>"
+
+
+def _make_summary_page(tab_name: str, stats: dict, hotai_docs: list[dict],
+                       today: datetime.date) -> str:
     week_str = today.strftime("第 %V 週")
-    total = stats["total"]
-    max_ind = max(stats["industry_count"].values(), default=1)
-    max_src = max(stats["source_count"].values(), default=1)
+    total    = stats["total"]
+    max_ind  = max(stats["industry_count"].values(), default=1)
+    max_src  = max(stats["source_count"].values(), default=1)
 
+    # Region breakdown
     region_rows = ""
-    for region in ["台灣", "中國", "東南亞", "全球"]:
+    for region in _REGION_ORDER:
         cnt = stats["region_count"].get(region, 0)
         pct = cnt / total * 100 if total else 0
-        emoji = REGION_EMOJI.get(region, "")
         region_rows += (
-            f"<tr><td>{emoji} {region}</td><td><strong>{cnt}</strong></td><td>{pct:.1f}%</td>"
+            f"<tr><td>{region}</td><td><strong>{cnt}</strong></td><td>{pct:.1f}%</td>"
             f"<td><div class='bar-wrap'><div class='bar-fill' style='width:{pct:.0f}%'></div></div></td></tr>"
         )
 
+    # Industry heatmap
     industry_rows = ""
     for ind, cnt in stats["industry_count"].most_common(10):
         pct = cnt / max_ind * 100
         industry_rows += (
-            f"<tr><td>{ind}</td>"
+            f"<tr><td>{_html.escape(ind)}</td>"
             f"<td><div class='bar-wrap'><div class='bar-fill' style='width:{pct:.0f}%'></div></div></td>"
             f"<td><strong>{cnt}</strong></td></tr>"
         )
 
-    funding_section = ""
-    if stats["funding_articles"]:
-        rows_html = ""
-        for i, item in enumerate(stats["funding_articles"], 1):
-            emoji = REGION_EMOJI.get(item["region"], "")
-            safe_title   = _html.escape(item["title"])
-            safe_url     = _html.escape(item["url"])
-            safe_funding = _html.escape(item["funding"])
-            safe_stage   = _html.escape(item["stage"])
-            stage_badge = f"<span class='badge badge-blue'>{safe_stage}</span>" if item["stage"] else "-"
-            rows_html += (
+    # Hotai top 10 ranking
+    hotai_ranking = ""
+    if hotai_docs:
+        rows_h = ""
+        for i, doc in enumerate(hotai_docs, 1):
+            name    = _html.escape(doc.get("companyName") or doc.get("companyNameEn") or "—")
+            name_en = _html.escape(doc.get("companyNameEn") or "")
+            ind_str = _html.escape(", ".join((doc.get("industry") or [])[:2]) or "—")
+            stage   = _html.escape(doc.get("stage") or "—")
+            url     = _html.escape(doc.get("sourceUrl") or "")
+            region  = _html.escape(doc.get("region") or "—")
+            tags    = _html.escape(", ".join(doc.get("fitTags") or []))
+            hotai   = doc.get("hotaiFitScore")
+            fit     = doc.get("fitScore")
+            ml      = doc.get("mlScore")
+            name_link = f"<a href='{url}' target='_blank'>{name}</a>" if url else name
+            name_cell = name_link + (f"<br><small style='color:#7a8aaa'>{name_en}</small>" if name_en else "")
+            rows_h += (
                 f"<tr><td class='idx'>{i}</td>"
-                f"<td><a href='{safe_url}' target='_blank'>{safe_title}</a></td>"
-                f"<td><span class='badge badge-green'>{safe_funding}</span></td>"
-                f"<td>{emoji} {_html.escape(item['region'])}</td>"
-                f"<td>{stage_badge}</td></tr>"
-            )
-        funding_section = (
-            "<div class='section'><div class='section-title'>融資亮點</div>"
-            "<table class='data-table'><thead><tr><th>#</th><th>標題</th><th>金額</th><th>地區</th><th>輪次</th></tr></thead>"
-            f"<tbody>{rows_html}</tbody></table></div>"
-        )
-
-    # ── 和泰適配度排行 HTML ──
-    hotai_section = ""
-    if stats.get("hotai_top"):
-        hotai_rows = ""
-        for i, doc in enumerate(stats["hotai_top"], 1):
-            name     = _html.escape(doc.get("companyName") or doc.get("companyNameEn") or "—")
-            name_en  = _html.escape(doc.get("companyNameEn") or "")
-            industry = _html.escape(", ".join((doc.get("industry") or [])[:2]) or "—")
-            stage    = _html.escape(doc.get("stage") or "—")
-            url      = _html.escape(doc.get("sourceUrl") or "")
-            region   = doc.get("region", "—")
-            hotai    = doc.get("hotaiFitScore")
-            fit      = doc.get("fitScore")
-            ml       = doc.get("mlScore")
-            rule     = doc.get("ruleScore")
-            tags     = ", ".join(doc.get("fitTags") or [])
-            emoji    = REGION_EMOJI.get(region, "")
-
-            def score_bar(v, css_class="bar-fill"):
-                if v is None: return "—"
-                pct = min(100, v * 10)
-                clr = "#e07b00" if v >= 7 else ("#2d7dd2" if v >= 4 else "#c0392b")
-                return (f"<div style='display:flex;align-items:center;gap:6px'>"
-                        f"<div class='bar-wrap' style='flex:1;min-width:50px'>"
-                        f"<div style='width:{pct:.0f}%;height:7px;border-radius:4px;background:{clr}'></div></div>"
-                        f"<strong style='min-width:26px;color:{clr};font-size:.85rem'>{v:.1f}</strong></div>")
-
-            name_link = f"<a href='{url}' target='_blank' style='color:#1a5cb5'>{name}</a>" if url else name
-            hotai_rows += (
-                f"<tr><td class='idx'>{i}</td>"
-                f"<td><strong>{name_link}</strong>"
-                f"{'<br><small style=\"color:#7a8aaa\">' + name_en + '</small>' if name_en else ''}</td>"
-                f"<td><span class='badge badge-blue'>{industry}</span></td>"
+                f"<td>{name_cell}</td>"
+                f"<td><span class='badge badge-blue'>{ind_str}</span></td>"
                 f"<td><span class='badge badge-orange'>{stage}</span></td>"
-                f"<td>{score_bar(hotai)}</td>"
-                f"<td>{score_bar(fit)}</td>"
-                f"<td style='color:#7a8aaa;font-size:.82rem'>{ml:.1f if ml is not None else '—'}</td>"
-                f"<td style='color:#7a8aaa;font-size:.82rem'>{rule:.1f if rule is not None else '—'}</td>"
-                f"<td>{emoji} {_html.escape(region)}</td>"
-                f"<td><small style='color:#7a8aaa'>{_html.escape(tags)}</small></td></tr>"
+                f"<td>{_score_badge(hotai)}</td>"
+                f"<td>{_score_badge(fit)}</td>"
+                f"<td style='color:#7a8aaa'>{ml:.1f if ml is not None else '-'}</td>"
+                f"<td>{region}</td>"
+                f"<td><small style='color:#7a8aaa'>{tags}</small></td></tr>"
             )
-        hotai_section = (
-            "<div class='section'>"
-            "<div class='section-title'>和泰集團適配度排行</div>"
-            "<div class='hotai-header'>評分公式：25% ML關鍵字 + 50% Qwen語意 + 25% 業務規則（地區/輪次/業務直接命中）&nbsp;·&nbsp;本週最高前10</div>"
-            "<table class='data-table'><thead><tr>"
-            "<th>#</th><th>公司</th><th>產業</th><th>輪次</th>"
-            "<th>和泰適配</th><th>新聞品質</th><th>ML</th><th>規則</th><th>地區</th><th>業務標籤</th>"
-            "</tr></thead>"
-            f"<tbody>{hotai_rows}</tbody></table></div>"
-        )
+        hotai_ranking = f"""
+<div class='section'>
+  <div class='section-title'>和泰集團適配度排行 Top 10</div>
+  <div class='hotai-note'>評分公式：25% ML關鍵字 + 50% Qwen語意 + 25% 業務規則（地區/輪次/業務命中）</div>
+  <table class='dt'><thead><tr>
+    <th>#</th><th>公司</th><th>產業</th><th>輪次</th>
+    <th>和泰適配</th><th>新聞品質</th><th>ML</th><th>地區</th><th>業務標籤</th>
+  </tr></thead><tbody>{rows_h}</tbody></table>
+</div>"""
 
-    notable_items = ""
-    for i, item in enumerate(stats["notable"], 1):
-        emoji = REGION_EMOJI.get(item["region"], "🌐")
-        safe_title = _html.escape(item["title"])
-        safe_url   = _html.escape(item["url"])
-        link = f"<a href='{safe_url}' target='_blank'>{safe_title}</a>" if item["url"] else safe_title
-        notable_items += f"<li><span class='idx'>{i}</span><span>{emoji} {link}</span></li>"
-
+    # Source activity
     source_rows = ""
     for src, cnt in stats["source_count"].most_common(10):
         pct = cnt / max_src * 100
         source_rows += (
-            f"<tr><td>{src}</td>"
-            f"<td><div style='display:flex;align-items:center;gap:10px'>"
-            f"<div class='bar-wrap' style='flex:1'><div class='bar-fill' style='width:{pct:.0f}%'></div></div>"
-            f"<strong style='min-width:30px;text-align:right'>{cnt}</strong></div></td></tr>"
+            f"<tr><td>{_html.escape(src)}</td>"
+            f"<td><div class='bar-wrap'><div class='bar-fill' style='width:{pct:.0f}%'></div></div></td>"
+            f"<td><strong>{cnt}</strong></td></tr>"
         )
 
-    return HTML_TEMPLATE.format(
-        week=week_str,
-        date=today.strftime("%Y-%m-%d"),
-        tab=tab_name,
-        total=total,
-        processed=stats["processed_count"].get("true", 0),
-        funding_cnt=len(stats["funding_articles"]),
-        notable_cnt=len(stats["notable"]),
-        region_rows=region_rows,
-        industry_rows=industry_rows,
-        funding_section=funding_section,
-        hotai_section=hotai_section,
-        notable_items=notable_items,
-        source_rows=source_rows,
-        generated_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    return f"""<div class='page'>
+  <div class='report-header'>
+    <h1>新創情報周報</h1>
+    <div class='meta'>{week_str} &nbsp;·&nbsp; {today.strftime('%Y-%m-%d')} &nbsp;·&nbsp; {_html.escape(tab_name)}</div>
+  </div>
+
+  <table class='cards-table'><tr>
+    <td><div class='card-num' style='color:#1a5cb5'>{total}</div><div class='card-label'>總文章數</div></td>
+    <td><div class='card-num' style='color:#1a7a3e'>{stats['processed_count'].get('true',0)}</div><div class='card-label'>AI 已分析</div></td>
+    <td><div class='card-num' style='color:#a05000'>{len(stats['funding_articles'])}</div><div class='card-label'>融資新聞</div></td>
+    <td><div class='card-num' style='color:#6a1a8e'>{len(stats['notable'])}</div><div class='card-label'>重點新聞</div></td>
+  </tr></table>
+
+  <div class='section'>
+    <div class='section-title'>地區分佈</div>
+    <table class='dt'><thead><tr><th>地區</th><th>文章數</th><th>佔比</th><th>趨勢</th></tr></thead>
+    <tbody>{region_rows}</tbody></table>
+  </div>
+
+  <div class='section'>
+    <div class='section-title'>產業熱度 Top 10</div>
+    <table class='dt'><thead><tr><th>產業</th><th>熱度</th><th>數量</th></tr></thead>
+    <tbody>{industry_rows}</tbody></table>
+  </div>
+
+  {hotai_ranking}
+
+  <div class='section'>
+    <div class='section-title'>來源活躍度</div>
+    <table class='dt'><thead><tr><th>媒體</th><th>趨勢</th><th>數量</th></tr></thead>
+    <tbody>{source_rows}</tbody></table>
+  </div>
+
+  <div class='footer'>報告產生時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;·&nbsp; Powered by Qwen 2.5 + Claude</div>
+</div>"""
+
+
+def _make_region_page(region: str, articles: list[dict],
+                      scored_map: dict, source_map: dict) -> str:
+    if not articles:
+        return ""
+
+    # Sort: scored desc first, then unscored alphabetically
+    def sort_key(a):
+        doc = scored_map.get(a["url"], {})
+        s = doc.get("hotaiFitScore")
+        return (0 if s is None else 1, -(s or 0))
+
+    sorted_articles = sorted(articles, key=sort_key)
+
+    scored_count = sum(1 for a in articles if a["url"] in scored_map)
+    rows_html = ""
+    for i, article in enumerate(sorted_articles, 1):
+        url      = article.get("url", "")
+        title    = _html.escape(article.get("title", "")[:90])
+        src_id   = article.get("source", "")
+        src_name = _html.escape(source_map.get(src_id, src_id))
+        fetched  = article.get("fetchedAt", "")[:10]
+
+        doc     = scored_map.get(url, {})
+        company = _html.escape(doc.get("companyName") or doc.get("companyNameEn") or "")
+        stage   = _html.escape(doc.get("stage") or "")
+        hotai   = doc.get("hotaiFitScore")
+        tags    = _html.escape(", ".join((doc.get("fitTags") or [])[:2]))
+
+        title_cell = f"<a href='{_html.escape(url)}' target='_blank'>{title}</a>" if url else title
+        company_cell = f"<strong>{company}</strong>" + (f" <span class='badge badge-orange'>{stage}</span>" if stage else "") if company else "<span style='color:#b0bac8'>-</span>"
+
+        rows_html += (
+            f"<tr><td class='idx'>{i}</td>"
+            f"<td>{title_cell}</td>"
+            f"<td style='color:#5a6a8a;white-space:nowrap'>{src_name}</td>"
+            f"<td style='color:#8a9ab5;white-space:nowrap'>{fetched}</td>"
+            f"<td>{company_cell}</td>"
+            f"<td style='color:#7a8aaa;font-size:.78rem'>{tags}</td>"
+            f"<td style='text-align:center'>{_score_badge(hotai)}</td></tr>"
+        )
+
+    return f"""<div class='region-page'>
+  <div class='region-header'>
+    <h2>{_html.escape(region)} 新創投資情報</h2>
+    <div class='sub'>共 {len(articles)} 篇文章 &nbsp;·&nbsp; 其中 {scored_count} 篇已 AI 評分</div>
+  </div>
+  <div class='hotai-note'>和泰適配度：7-10 高度相關 &nbsp;·&nbsp; 4-6 中度相關 &nbsp;·&nbsp; 1-3 低度相關 &nbsp;·&nbsp; - 尚未評分</div>
+  <table class='dt'>
+    <thead><tr>
+      <th>#</th><th>標題</th><th>來源</th><th>日期</th><th>公司 / 輪次</th><th>業務標籤</th>
+      <th style='text-align:center;min-width:70px'>和泰適配度</th>
+    </tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+</div>"""
+
+
+def render_html(tab_name: str, rows: list[dict], stats: dict,
+                scored_map: dict | None = None) -> str:
+    if scored_map is None:
+        scored_map = {}
+
+    today      = datetime.date.today()
+    source_map = {s["id"]: s["name"] for s in SOURCES}
+
+    # Hotai top 10 from scored_map (all scored docs, not just the query limit)
+    hotai_docs = sorted(
+        [d for d in scored_map.values() if d.get("hotaiFitScore") is not None],
+        key=lambda d: d["hotaiFitScore"], reverse=True,
+    )[:10]
+
+    # Group articles by region
+    by_region: dict[str, list] = {}
+    for row in rows:
+        r = row.get("region", "全球")
+        by_region.setdefault(r, []).append(row)
+
+    summary  = _make_summary_page(tab_name, stats, hotai_docs, today)
+    pages    = [summary]
+    for region in _REGION_ORDER:
+        pg = _make_region_page(region, by_region.get(region, []), scored_map, source_map)
+        if pg:
+            pages.append(pg)
+
+    body = "\n".join(pages)
+    return f"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>新創情報周報 {today.strftime("第%V週")}</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;800&display=swap" rel="stylesheet">
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
 
 
 # ── Entry point ──
@@ -713,13 +751,17 @@ def main():
         return
 
     stats = analyze_rows(rows)
-    # load hotaiFitScore rankings from Firebase
     from ai_processor import collection_for_tab
-    stats["hotai_top"] = load_hotai_top(collection_for_tab(tab_name))
+    scored_map = load_scored_map(collection_for_tab(tab_name))
+    # pass to terminal renderer for Hotai ranking table
+    stats["hotai_top"] = sorted(
+        [d for d in scored_map.values() if d.get("hotaiFitScore") is not None],
+        key=lambda d: d["hotaiFitScore"], reverse=True,
+    )[:10]
     render_terminal(tab_name, rows, stats)
 
     if output_html or send_email or dry_email:
-        html = render_html(tab_name, rows, stats)
+        html = render_html(tab_name, rows, stats, scored_map=scored_map)
 
     if output_html:
         filename = f"weekly_report_{datetime.date.today()}.html"

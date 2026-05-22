@@ -58,10 +58,14 @@ def step3_report(tab_name: str | None = None, send_email: bool = False):
         return
 
     stats = analyze_rows(rows)
-    from weekly_report import load_hotai_top
+    from weekly_report import load_scored_map
     from ai_processor import collection_for_tab
-    stats["hotai_top"] = load_hotai_top(collection_for_tab(tab_name or ""))
-    html = render_html(tab_name or "all_tabs", rows, stats)
+    scored_map = load_scored_map(collection_for_tab(tab_name or ""))
+    stats["hotai_top"] = sorted(
+        [d for d in scored_map.values() if d.get("hotaiFitScore") is not None],
+        key=lambda d: d["hotaiFitScore"], reverse=True,
+    )[:10]
+    html = render_html(tab_name or "all_tabs", rows, stats, scored_map=scored_map)
 
     if send_email:
         ok = send_weekly_report(html)
