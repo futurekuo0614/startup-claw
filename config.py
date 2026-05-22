@@ -53,15 +53,55 @@ SOURCES = [
 
 REGION_MAP = {s["id"]: s["region"] for s in SOURCES}
 
+# 和泰集團八大業務柱對應關鍵字（用於 ML 特徵評分）
+# 業務背景：Toyota/Lexus/Hino 總代理、iRent/yoxi/和運租車 MaaS、和泰產險/和安保險、
+#           和潤企業汽車金融、和泰Pay/Points/聯名卡、去趣旅遊 App、EVRun 充電、AI 中台
 FIT_KEYWORDS = {
-    "Mobility":    ["自駕", "電動車", "EV", "MaaS", "車隊", "停車", "充電", "Fleet", "共乘", "車聯網", "ADAS", "autonomous"],
-    "InsurTech":   ["保險", "insurtech", "核保", "理賠", "再保", "保費", "UBI", "insurance"],
-    "FinTech":     ["支付", "fintech", "借貸", "區塊鏈", "數位銀行", "理財", "信用", "payment", "lending", "crypto"],
-    "Healthcare":  ["醫療", "健康", "medtech", "遠距", "生技", "基因", "藥物", "診斷", "health", "biotech", "pharma"],
-    "Logistics":   ["物流", "供應鏈", "倉儲", "配送", "冷鏈", "運輸", "logistics", "supply chain", "delivery"],
-    "AI":          ["人工智慧", "機器學習", "深度學習", "大模型", "LLM", "AI", "artificial intelligence", "machine learning"],
-    "SaaS":        ["SaaS", "雲端", "訂閱", "企業軟體", "ERP", "CRM", "cloud", "B2B software"],
-    "Ecommerce":   ["電商", "電子商務", "零售", "marketplace", "ecommerce", "retail"],
+    # iRent、yoxi、和運租車、MaaS 生態
+    "MaaS_Mobility": [
+        "MaaS", "共享汽車", "car sharing", "ride hailing", "叫車", "租車", "車隊管理",
+        "fleet management", "短租", "長租", "共乘", "出行平台", "mobility service",
+        "乘車", "代駕", "派遣", "mobility as a service", "shared mobility",
+    ],
+    # EVRun 充電網、U-POWER 投資、Toyota MIRAI 氫能
+    "EV_Charging": [
+        "電動車", "EV", "充電樁", "充電站", "充電基礎設施", "氫能", "氫燃料",
+        "hydrogen", "FCEV", "換電", "battery swap", "CPO", "充電管理", "smart charging",
+        "charging infrastructure", "ev charging", "電動化", "electrification",
+    ],
+    # 車聯網、ADAS、智慧座艙、預測保養
+    "AutoTech_ADAS": [
+        "ADAS", "自動駕駛", "autonomous", "車聯網", "V2X", "OBD", "telematics",
+        "車載", "智慧座艙", "cockpit", "預測保養", "predictive maintenance",
+        "connected vehicle", "車輛感測", "lidar", "雷達", "over-the-air", "OTA",
+    ],
+    # 和泰產險、和安保險、UBI 車險
+    "InsurTech": [
+        "保險", "insurtech", "UBI", "車險", "usage-based insurance", "telematics insurance",
+        "理賠自動化", "核保", "再保", "數位保險", "嵌入式保險", "embedded insurance",
+        "insurance tech", "parametric insurance",
+    ],
+    # 和潤企業：汽車貸款、融資租賃
+    "AutoFinance": [
+        "汽車貸款", "車貸", "融資租賃", "auto finance", "leasing", "分期付款",
+        "殘值", "balloon payment", "fleet financing", "設備融資", "auto loan",
+    ],
+    # 和泰Pay、和泰Points、和泰聯名卡：點數經濟與支付
+    "Loyalty_Payment": [
+        "點數", "loyalty", "會員生態", "支付", "payment", "digital wallet", "信用卡",
+        "co-branded card", "reward", "回饋", "fintech", "數位支付", "points economy",
+    ],
+    # 和泰 AI 中台、AI First 戰略：生成式 AI、資料平台
+    "AI_DataPlatform": [
+        "人工智慧", "機器學習", "AI", "大數據", "data platform", "個人化",
+        "personalization", "預測分析", "generative AI", "LLM", "AI platform",
+        "數位轉型", "API platform", "生成式", "大模型",
+    ],
+    # 去趣 App：旅遊規劃、跨境出行
+    "TravelTech": [
+        "旅遊科技", "travel tech", "旅行規劃", "trip planning", "tourism platform",
+        "訂房", "訂票", "出行", "跨境旅遊", "smart tourism", "旅遊 APP",
+    ],
 }
 
 

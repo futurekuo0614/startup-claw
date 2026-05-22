@@ -2,6 +2,7 @@ import time
 import re
 import logging
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 import feedparser
 import requests
 import gspread
@@ -11,17 +12,39 @@ from config import SOURCES, SKIP_KEYWORDS, MAX_ARTICLES_PER_SOURCE, SHEETS_ID, G
 
 logger = logging.getLogger(__name__)
 
-ONE_WEEK_AGO = datetime.now(timezone.utc) - timedelta(days=7)
+ONE_WEEK_AGO   = datetime.now(timezone.utc) - timedelta(days=7)
+NINETY_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=90)
+
+def _parse_pub_date(entry) -> datetime | None:
+    """Return the publication datetime from an RSS entry, or None if unavailable."""
+    parsed = None
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
+        parsed = entry.published_parsed
+    elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
+        parsed = entry.updated_parsed
+    if parsed is None:
+        return None
+    try:
+        return datetime(*parsed[:6], tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 def is_within_one_week(entry) -> bool:
-    pub=None
-    if hasattr(entry,"published_parsed") and entry.published_parsed: pub=entry.published_parsed
-    elif hasattr(entry,"updated_parsed") and entry.updated_parsed: pub=entry.updated_parsed
-    if pub is None: return True
-    try:
-        pub_dt=datetime(*pub[:6],tzinfo=timezone.utc)
-        return pub_dt >= ONE_WEEK_AGO
-    except: return True
+    pub_dt = _parse_pub_date(entry)
+    if pub_dt is None:
+        return True  # no date → let through, AI processor will catch very old ones
+    return pub_dt >= ONE_WEEK_AGO
+
+def _normalize_title(title: str) -> str:
+    """Lowercase + remove punctuation for similarity comparison."""
+    return re.sub(r"[\W_]+", " ", title.lower()).strip()
+
+def _is_duplicate_title(title: str, seen_titles: list[str], threshold: float = 0.82) -> bool:
+    norm = _normalize_title(title)
+    for seen in seen_titles:
+        if SequenceMatcher(None, norm, seen).ratio() >= threshold:
+            return True
+    return False
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -40,8 +63,8 @@ def get_or_create_sheet(gc: gspread.Client, tab_name: str) -> gspread.Worksheet:
     try:
         return ss.worksheet(tab_name)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=tab_name, rows=2000, cols=7)
-        ws.append_row(["url", "title", "content", "source", "region", "fetchedAt", "processed"])
+        ws = ss.add_worksheet(title=tab_name, rows=2000, cols=8)
+        ws.append_row(["url", "title", "content", "source", "region", "fetchedAt", "processed", "publishedAt"])
         ws.freeze(rows=1)
         logger.info("Created sheet tab: %s", tab_name)
         return ws
@@ -89,18 +112,25 @@ def should_skip(title: str) -> bool:
     return any(kw.lower() in t for kw in SKIP_KEYWORDS)
 
 
-def scrape_source(source: dict, ws: gspread.Worksheet, existing_urls: set) -> int:
+def scrape_source(source: dict, ws: gspread.Worksheet, existing_urls: set,
+                  seen_titles: list[str]) -> int:
     articles = fetch_rss(source["rss"])
     rows_batch = []
     logger.info("  %s: found %d articles", source["name"], len(articles))
-    saved = 0
+    saved = skipped_dup = skipped_kw = 0
+
     for article in articles:
         if saved >= MAX_ARTICLES_PER_SOURCE:
             break
         if article["url"] in existing_urls:
             continue
         if should_skip(article["title"]):
+            skipped_kw += 1
             logger.debug("  Skip (keyword): %s", article["title"][:50])
+            continue
+        if _is_duplicate_title(article["title"], seen_titles):
+            skipped_dup += 1
+            logger.debug("  Skip (duplicate title): %s", article["title"][:50])
             continue
 
         content = "\n\n".join(filter(None, [
@@ -117,14 +147,16 @@ def scrape_source(source: dict, ws: gspread.Worksheet, existing_urls: set) -> in
             source["region"],
             datetime.now(timezone.utc).isoformat(),
             "false",
+            article.get("publishedAt", ""),   # col 8: publishedAt for AI processor date-filter
         ])
         existing_urls.add(article["url"])
+        seen_titles.append(_normalize_title(article["title"]))
         saved += 1
 
     if rows_batch:
         ws.append_rows(rows_batch, value_input_option="RAW")
         time.sleep(1.5)
-    logger.info("  Saved %d new articles", saved)
+    logger.info("  Saved %d | dup_skip=%d kw_skip=%d", saved, skipped_dup, skipped_kw)
     return saved
 
 
@@ -135,6 +167,7 @@ def run_all_scrapers(tab_name: str | None = None) -> str:
     gc = get_sheets_client()
     ws = get_or_create_sheet(gc, tab_name)
     existing_urls = get_existing_urls(ws)
+    seen_titles: list[str] = []  # cross-source title dedup within this run
 
     enabled = [s for s in SOURCES if s["enabled"]]
     logger.info("runAllScrapers: %d sources → sheet: %s", len(enabled), tab_name)
@@ -142,7 +175,7 @@ def run_all_scrapers(tab_name: str | None = None) -> str:
     for source in enabled:
         try:
             logger.info("📰 %s [%s]", source["name"], source["region"])
-            scrape_source(source, ws, existing_urls)
+            scrape_source(source, ws, existing_urls, seen_titles)
         except Exception as e:
             logger.error("❌ %s: %s", source["id"], e)
 
@@ -157,13 +190,14 @@ def run_scraper_by_region(region: str, tab_name: str | None = None) -> str:
     gc = get_sheets_client()
     ws = get_or_create_sheet(gc, tab_name)
     existing_urls = get_existing_urls(ws)
+    seen_titles: list[str] = []
 
     sources = [s for s in SOURCES if s["enabled"] and s["region"] == region]
     logger.info("scrape [%s]: %d sources", region, len(sources))
 
     for source in sources:
         try:
-            scrape_source(source, ws, existing_urls)
+            scrape_source(source, ws, existing_urls, seen_titles)
         except Exception as e:
             logger.error("❌ %s: %s", source["id"], e)
 

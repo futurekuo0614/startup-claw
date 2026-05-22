@@ -3,7 +3,7 @@ import json
 import re
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -203,6 +203,21 @@ def _is_valid_company_name(name: str) -> bool:
     return name.strip().lower() not in _PLACEHOLDER_NAMES
 
 
+_HOTAI_CONTEXT = (
+    "Hotai Group (和泰集團) is Taiwan's largest automotive conglomerate: "
+    "Toyota/Lexus/Hino exclusive distributor (38.6% market share); "
+    "MaaS services — iRent car-sharing (10K vehicles), yoxi ride-hailing, Ho Ing long-term rental; "
+    "和泰產險 P&C insurance & 和安保險 auto insurance agency; "
+    "和潤企業 auto loans & leasing (largest non-bank financier in Taiwan); "
+    "和泰Pay digital payment + 和泰Points loyalty (3B+ points, 4M members) + co-branded card; "
+    "去趣 travel-planning app (3.5M downloads); "
+    "EVRun EV-charging network + U-POWER investment + MIRAI hydrogen buses; "
+    "和泰AI中台 AI platform — 'AI First' strategy 2026. "
+    "Strategic priorities: MaaS ecosystem, EV/hydrogen transition, InsurTech, "
+    "auto-finance digitization, AI/data platform, smart tourism."
+)
+
+
 def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) -> str:
     hints = []
     if prefilled.get("stage"):
@@ -225,13 +240,20 @@ def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) ->
         '"industry":["AI","SaaS"],'
         '"stage":"Pre-A","fundingAmountRaw":"數百萬美元",'
         '"investors":["紅杉中國"],"founded":"2023","website":"",'
-        '"relevanceScore":7}\n\n'
-        "relevanceScore scale (0-10):\n"
+        '"relevanceScore":7,"hotaiFitScore":6}\n\n'
+        "relevanceScore scale (0-10) — news quality:\n"
         "  9-10: confirmed funding round with amount and investors named\n"
         "  7-8:  confirmed funding round or product launch, some details\n"
         "  5-6:  startup mentioned but funding/product unclear\n"
         "  3-4:  tangentially related (industry report, large corp with startup angle)\n"
         "  0-2:  irrelevant (macro, stock market, policy, large public corp)\n\n"
+        f"hotaiFitScore scale (0-10) — strategic fit for {_HOTAI_CONTEXT}\n"
+        "  9-10: core fit — directly addresses Hotai's main businesses "
+        "(EV/charging, MaaS/mobility, ADAS/connected-vehicle, auto InsurTech, auto finance)\n"
+        "  7-8:  strong fit — AI/data platform, loyalty/payment ecosystem, smart tourism, fleet management\n"
+        "  5-6:  adjacent fit — general InsurTech, FinTech, logistics, mobility-adjacent tech\n"
+        "  3-4:  weak fit — general SaaS/consumer tech with possible Hotai synergies\n"
+        "  0-2:  no clear strategic fit for Hotai\n\n"
         "Now extract from:\n"
         f"Title: {title}\nSummary: {summary[:250]}"
     )
@@ -511,29 +533,34 @@ def calc_ml_score(result: dict) -> tuple[float, list[str]]:
 
 def calc_fit_score(result: dict) -> dict:
     """
-    Hybrid score = 70% ML feature score + 30% Qwen semantic score.
-    若 Qwen 未回傳 relevanceScore（舊文章、parse 失敗），則 100% 用 ML score。
+    fitScore     = 70% ML keyword score + 30% Qwen relevanceScore（新聞品質）
+    hotaiFitScore = 70% ML keyword score + 30% Qwen hotaiFitScore（和泰策略適配）
+    若 Qwen 未回傳對應欄位，則 100% 用 ML score。
     """
     ml_score, tags = calc_ml_score(result)
 
-    qwen_score: float | None = None
-    try:
-        raw = result.get("relevanceScore")
-        if raw is not None:
-            qwen_score = max(0.0, min(10.0, float(raw)))
-    except (TypeError, ValueError):
-        pass
+    def _parse_qwen(field: str) -> float | None:
+        try:
+            raw = result.get(field)
+            if raw is not None:
+                return max(0.0, min(10.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+        return None
 
-    if qwen_score is not None:
-        final = round(0.7 * ml_score + 0.3 * qwen_score, 1)
-    else:
-        final = ml_score
+    qwen_score  = _parse_qwen("relevanceScore")
+    hotai_qwen  = _parse_qwen("hotaiFitScore")
+
+    final = round(0.7 * ml_score + 0.3 * qwen_score, 1) if qwen_score is not None else ml_score
+    hotai_final = round(0.7 * ml_score + 0.3 * hotai_qwen, 1) if hotai_qwen is not None else ml_score
 
     return {
-        "fitScore": final,
-        "fitTags": tags,
-        "mlScore": ml_score,
-        "qwenScore": qwen_score,
+        "fitScore":      final,
+        "fitTags":       tags,
+        "mlScore":       ml_score,
+        "qwenScore":     qwen_score,
+        "hotaiFitScore": hotai_final,
+        "hotaiQwenScore": hotai_qwen,
     }
 
 
@@ -598,13 +625,33 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
     # ── Stage 0：規則分類 ──
     to_skip, to_extract, to_classify = [], [], []
 
+    NINETY_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=90)
+
     for item in batch:
         row_data = item["data"]
-        title_raw = row_data[1] if len(row_data) > 1 else ""
-        content   = row_data[2] if len(row_data) > 2 else ""
+        title_raw    = row_data[1] if len(row_data) > 1 else ""
+        content      = row_data[2] if len(row_data) > 2 else ""
+        published_at = row_data[7] if len(row_data) > 7 else ""  # col 8 added by scraper
         title, summary = parse_content_field(content)
         if not title:
             title = title_raw
+
+        # Date filter: skip articles older than 90 days (Google News sometimes recirculates old articles)
+        if published_at:
+            try:
+                from email.utils import parsedate_to_datetime
+                pub_dt = parsedate_to_datetime(published_at)
+                if pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                if pub_dt < NINETY_DAYS_AGO:
+                    logger.info("   📅 Skip old article (%s): %s", published_at[:16], title[:50])
+                    item["title"]     = title
+                    item["summary"]   = summary
+                    item["prefilled"] = {}
+                    to_skip.append(item)
+                    continue
+            except Exception:
+                pass  # unparseable date → proceed normally
 
         amount, stage = extract_funding_from_title(title)
         item["title"]   = title
@@ -704,24 +751,24 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
                 result["fundingAmountUSD"] = normalize_funding(result.get("fundingAmountRaw", ""))
                 fd = calc_fit_score(result)
 
-                # Bug5 fix: validate score ranges before Firebase write
-                fit = max(0.0, min(10.0, fd["fitScore"]))
-                ml  = max(0.0, min(10.0, fd["mlScore"]))
-                if fit != fd["fitScore"] or ml != fd["mlScore"]:
-                    logger.warning("Score out of range clamped: fit=%.1f ml=%.1f", fd["fitScore"], fd["mlScore"])
+                def _clamp(v: float) -> float:
+                    return max(0.0, min(10.0, v))
 
-                result["fitScore"]  = fit
-                result["fitTags"]   = fd["fitTags"]
-                result["mlScore"]   = ml
+                result["fitScore"]       = _clamp(fd["fitScore"])
+                result["fitTags"]        = fd["fitTags"]
+                result["mlScore"]        = _clamp(fd["mlScore"])
+                result["hotaiFitScore"]  = _clamp(fd["hotaiFitScore"])
                 if fd["qwenScore"] is not None:
-                    result["qwenScore"] = max(0.0, min(10.0, fd["qwenScore"]))
+                    result["qwenScore"] = _clamp(fd["qwenScore"])
+                if fd["hotaiQwenScore"] is not None:
+                    result["hotaiQwenScore"] = _clamp(fd["hotaiQwenScore"])
 
                 # Idempotent write: URL hash as doc_id prevents duplicates on re-run
                 doc_id = hashlib.md5(url.encode()).hexdigest()[:16]
                 firestore_write(col_ref, result, doc_id=doc_id)
                 ws.update_cell(item["row"], 7, "true")
                 saved += 1
-                logger.info("   ✅ %s [score:%.1f]", company, result["fitScore"])
+                logger.info("   ✅ %s [fit:%.1f hotai:%.1f]", company, result["fitScore"], result["hotaiFitScore"])
             else:
                 # Valid JSON from Qwen but no identifiable company — expected for non-startups
                 reason = f"placeholder name: '{company}'" if company else "no companyName"

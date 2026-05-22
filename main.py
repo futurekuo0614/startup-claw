@@ -58,6 +58,9 @@ def step3_report(tab_name: str | None = None, send_email: bool = False):
         return
 
     stats = analyze_rows(rows)
+    from weekly_report import load_hotai_top
+    from ai_processor import collection_for_tab
+    stats["hotai_top"] = load_hotai_top(collection_for_tab(tab_name or ""))
     html = render_html(tab_name or "all_tabs", rows, stats)
 
     if send_email:

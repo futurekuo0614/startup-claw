@@ -102,6 +102,17 @@ def load_single_tab(tab_name: str) -> list[dict]:
     return rows
 
 
+def load_hotai_top(collection: str, limit: int = 10) -> list[dict]:
+    """從 Firebase 讀取本週 hotaiFitScore 最高的新創，用於報告排行榜。"""
+    try:
+        from firebase_client import firestore_query
+        docs = firestore_query(collection, order_by="hotaiFitScore", limit=limit)
+        return [d for d in docs if d.get("hotaiFitScore") is not None]
+    except Exception as e:
+        logger.warning("load_hotai_top failed: %s", e)
+        return []
+
+
 # ── Article title analysis (no AI needed) ──
 
 INDUSTRY_KEYWORDS = {
@@ -217,6 +228,7 @@ def analyze_rows(rows: list[dict]) -> dict:
         "processed_count": processed_count,
         "funding_articles": funding_articles[:10],
         "notable": notable[:8],
+        "hotai_top": [],  # populated separately via load_hotai_top()
     }
 
 
@@ -355,9 +367,47 @@ def render_terminal(tab_name: str, rows: list[dict], stats: dict):
     console.print(src_table)
     console.print()
 
+    # ── Hotai fit ranking (from Firebase) ──
+    if stats.get("hotai_top"):
+        console.print(Rule("[bold bright_white]和泰適配度排行 (Firebase AI 評分)", style="bright_blue"))
+        console.print()
+        hotai_table = Table(box=box.ROUNDED, show_header=True, header_style="bold bright_white",
+                            border_style="grey37", expand=True)
+        hotai_table.add_column("#",           justify="right", min_width=3)
+        hotai_table.add_column("公司",         min_width=16)
+        hotai_table.add_column("產業",         min_width=16)
+        hotai_table.add_column("輪次",         min_width=8)
+        hotai_table.add_column("和泰適配",     justify="center", min_width=9)
+        hotai_table.add_column("新聞品質",     justify="center", min_width=9)
+        hotai_table.add_column("ML分",        justify="center", min_width=7)
+        hotai_table.add_column("地區",         min_width=8)
+        for i, doc in enumerate(stats["hotai_top"], 1):
+            name     = doc.get("companyName") or doc.get("companyNameEn") or "—"
+            industry = ", ".join((doc.get("industry") or [])[:2]) or "—"
+            stage    = doc.get("stage") or "—"
+            hotai    = doc.get("hotaiFitScore")
+            fit      = doc.get("fitScore")
+            ml       = doc.get("mlScore")
+            region   = doc.get("region", "—")
+            def score_color(v):
+                if v is None: return "grey50"
+                return "bright_green" if v >= 7 else ("bright_yellow" if v >= 4 else "bright_red")
+            hotai_table.add_row(
+                str(i),
+                f"[bold bright_white]{name[:18]}[/]",
+                f"[grey70]{industry[:18]}[/]",
+                f"[bright_cyan]{stage}[/]",
+                f"[bold {score_color(hotai)}]{hotai:.1f}[/]" if hotai is not None else "—",
+                f"[{score_color(fit)}]{fit:.1f}[/]"          if fit   is not None else "—",
+                f"[grey70]{ml:.1f}[/]"                        if ml    is not None else "—",
+                f"{REGION_EMOJI.get(region,'')} {region}",
+            )
+        console.print(hotai_table)
+        console.print()
+
     # ── Notable articles ──
     if stats["notable"]:
-        console.print(Rule("[bold bright_white]⭐ 本週重點新聞", style="bright_blue"))
+        console.print(Rule("[bold bright_white]本週重點新聞", style="bright_blue"))
         console.print()
         for i, item in enumerate(stats["notable"], 1):
             emoji = REGION_EMOJI.get(item["region"], "🌐")
@@ -458,8 +508,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   {funding_section}
 
+  {hotai_section}
+
   <div class="section">
-    <div class="section-title">⭐ 本週重點新聞</div>
+    <div class="section-title">本週重點新聞</div>
     <div class="card" style="padding: 0;">
       <ul class="notable-list">{notable_items}</ul>
     </div>
@@ -528,12 +580,59 @@ def render_html(tab_name: str, rows: list[dict], stats: dict) -> str:
             f"<tbody>{rows_html}</tbody></table></div>"
         )
 
+    # ── 和泰適配度排行 HTML ──
+    hotai_section = ""
+    if stats.get("hotai_top"):
+        hotai_rows = ""
+        for i, doc in enumerate(stats["hotai_top"], 1):
+            name     = _html.escape(doc.get("companyName") or doc.get("companyNameEn") or "—")
+            name_en  = _html.escape(doc.get("companyNameEn") or "")
+            industry = _html.escape(", ".join((doc.get("industry") or [])[:2]) or "—")
+            stage    = _html.escape(doc.get("stage") or "—")
+            url      = _html.escape(doc.get("sourceUrl") or "")
+            region   = doc.get("region", "—")
+            hotai    = doc.get("hotaiFitScore")
+            fit      = doc.get("fitScore")
+            ml       = doc.get("mlScore")
+            tags     = ", ".join(doc.get("fitTags") or [])
+            emoji    = REGION_EMOJI.get(region, "")
+
+            def score_bar(v, color):
+                if v is None: return "—"
+                pct = min(100, v * 10)
+                return (f"<div style='display:flex;align-items:center;gap:6px'>"
+                        f"<div style='flex:1;background:#21262d;border-radius:4px;height:8px'>"
+                        f"<div style='width:{pct:.0f}%;height:8px;border-radius:4px;background:{color}'></div></div>"
+                        f"<strong style='min-width:28px;color:{color}'>{v:.1f}</strong></div>")
+
+            name_link = f"<a href='{url}' target='_blank'>{name}</a>" if url else name
+            hotai_rows += (
+                f"<tr><td class='idx'>{i}</td>"
+                f"<td><strong>{name_link}</strong>"
+                f"{'<br><small style=\"color:var(--muted)\">' + name_en + '</small>' if name_en else ''}</td>"
+                f"<td><span class='badge badge-blue'>{industry}</span></td>"
+                f"<td><span class='badge badge-green'>{stage}</span></td>"
+                f"<td>{score_bar(hotai, '#58a6ff')}</td>"
+                f"<td>{score_bar(fit, '#3fb950')}</td>"
+                f"<td><span style='color:var(--muted);font-size:.85rem'>{ml:.1f if ml is not None else '—'}</span></td>"
+                f"<td>{emoji} {_html.escape(region)}</td>"
+                f"<td><small style='color:var(--muted)'>{_html.escape(tags)}</small></td></tr>"
+            )
+        hotai_section = (
+            "<div class='section'>"
+            "<div class='section-title'>和泰集團適配度排行 <span style='font-size:.8rem;color:var(--muted);font-weight:400'>（AI + ML 混合評分 / 本週最高前10）</span></div>"
+            "<table><thead><tr>"
+            "<th>#</th><th>公司</th><th>產業</th><th>輪次</th>"
+            "<th>和泰適配 (0-10)</th><th>新聞品質 (0-10)</th><th>ML分</th><th>地區</th><th>業務標籤</th>"
+            "</tr></thead>"
+            f"<tbody>{hotai_rows}</tbody></table></div>"
+        )
+
     notable_items = ""
     for i, item in enumerate(stats["notable"], 1):
         emoji = REGION_EMOJI.get(item["region"], "🌐")
         safe_title = _html.escape(item["title"])
         safe_url   = _html.escape(item["url"])
-        # Bug4 fix: escape user-generated content before inserting into HTML
         link = f"<a href='{safe_url}' target='_blank'>{safe_title}</a>" if item["url"] else safe_title
         notable_items += f"<li><span class='idx'>{i}</span><span>{emoji} {link}</span></li>"
 
@@ -558,6 +657,7 @@ def render_html(tab_name: str, rows: list[dict], stats: dict) -> str:
         region_rows=region_rows,
         industry_rows=industry_rows,
         funding_section=funding_section,
+        hotai_section=hotai_section,
         notable_items=notable_items,
         source_rows=source_rows,
         generated_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -592,6 +692,9 @@ def main():
         return
 
     stats = analyze_rows(rows)
+    # load hotaiFitScore rankings from Firebase
+    from ai_processor import collection_for_tab
+    stats["hotai_top"] = load_hotai_top(collection_for_tab(tab_name))
     render_terminal(tab_name, rows, stats)
 
     if output_html or send_email or dry_email:
