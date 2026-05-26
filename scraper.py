@@ -1,6 +1,7 @@
 import time
 import re
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 import feedparser
@@ -113,8 +114,9 @@ def should_skip(title: str) -> bool:
 
 
 def scrape_source(source: dict, ws: gspread.Worksheet, existing_urls: set,
-                  seen_titles: list[str]) -> int:
-    articles = fetch_rss(source["rss"])
+                  seen_titles: list[str], articles: list[dict] | None = None) -> int:
+    if articles is None:
+        articles = fetch_rss(source["rss"])
     rows_batch = []
     logger.info("  %s: found %d articles", source["name"], len(articles))
     saved = skipped_dup = skipped_kw = 0
@@ -172,10 +174,25 @@ def run_all_scrapers(tab_name: str | None = None) -> str:
     enabled = [s for s in SOURCES if s["enabled"]]
     logger.info("runAllScrapers: %d sources → sheet: %s", len(enabled), tab_name)
 
+    # Fetch all RSS feeds concurrently (network I/O bound)
+    prefetched: dict[str, list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_source = {
+            executor.submit(fetch_rss, source["rss"]): source for source in enabled
+        }
+        for future in as_completed(future_to_source):
+            source = future_to_source[future]
+            try:
+                prefetched[source["id"]] = future.result()
+                logger.info("📰 %s [%s]: %d articles", source["name"], source["region"], len(prefetched[source["id"]]))
+            except Exception as e:
+                logger.error("❌ %s fetch: %s", source["id"], e)
+                prefetched[source["id"]] = []
+
+    # Write to Sheets sequentially to preserve dedup order and respect rate limits
     for source in enabled:
         try:
-            logger.info("📰 %s [%s]", source["name"], source["region"])
-            scrape_source(source, ws, existing_urls, seen_titles)
+            scrape_source(source, ws, existing_urls, seen_titles, prefetched.get(source["id"]))
         except Exception as e:
             logger.error("❌ %s: %s", source["id"], e)
 

@@ -59,8 +59,18 @@ def get_sheets_client():
     return gspread.authorize(creds)
 
 def get_sheet(tab_name: str) -> gspread.Worksheet:
-    gc = get_sheets_client()
-    return gc.open_by_key(SHEETS_ID).worksheet(tab_name)
+    return _get_gc().open_by_key(SHEETS_ID).worksheet(tab_name)
+
+
+_gc_cache: gspread.Client | None = None
+_scored_ws_cache: gspread.Worksheet | None = None
+
+
+def _get_gc() -> gspread.Client:
+    global _gc_cache
+    if _gc_cache is None:
+        _gc_cache = get_sheets_client()
+    return _gc_cache
 
 
 _SCORED_TAB = "scored_results"
@@ -72,20 +82,23 @@ _SCORED_HEADER = [
 ]
 
 def _get_or_create_scored_sheet(gc) -> gspread.Worksheet:
+    global _scored_ws_cache
+    if _scored_ws_cache is not None:
+        return _scored_ws_cache
     ss = gc.open_by_key(SHEETS_ID)
     try:
-        return ss.worksheet(_SCORED_TAB)
+        _scored_ws_cache = ss.worksheet(_SCORED_TAB)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=_SCORED_TAB, rows=5000, cols=len(_SCORED_HEADER))
-        ws.append_row(_SCORED_HEADER)
-        ws.freeze(rows=1)
+        _scored_ws_cache = ss.add_worksheet(title=_SCORED_TAB, rows=5000, cols=len(_SCORED_HEADER))
+        _scored_ws_cache.append_row(_SCORED_HEADER)
+        _scored_ws_cache.freeze(rows=1)
         logger.info("Created scored_results sheet tab")
-        return ws
+    return _scored_ws_cache
 
 def mirror_to_sheets(result: dict) -> None:
     """Append one scored startup row to the scored_results Sheets tab for human review."""
     try:
-        gc = get_sheets_client()
+        gc = _get_gc()
         ws = _get_or_create_scored_sheet(gc)
         row = [
             result.get("extractedAt", ""),
@@ -315,6 +328,50 @@ def build_extract_prompt(title: str, summary: str, url: str, prefilled: dict) ->
     )
 
 
+def build_classify_and_extract_prompt(title: str, summary: str, prefilled: dict) -> str:
+    """Combined Stage1+Stage2 prompt: classify whether startup, and if so extract all fields."""
+    hints = []
+    if prefilled.get("stage"):
+        hints.append(f"Funding stage: {prefilled['stage']}")
+    if prefilled.get("fundingAmountRaw"):
+        hints.append(f"Funding amount: {prefilled['fundingAmountRaw']}")
+    hint_text = ("Known info: " + ", ".join(hints) + "\n") if hints else ""
+
+    is_chinese = any("一" <= c <= "鿿" for c in title)
+    summary_ex = "公司本週完成Pre-A融資，專注AI數位員工平台" if is_chinese else "company raised $5M for enterprise AI platform"
+
+    return (
+        f"{hint_text}"
+        "Classify and extract. Is this article about a startup, innovative SME, or tech company?\n"
+        "INCLUDE: company funding, product launches, founder profiles, acquisitions, accelerator news.\n"
+        "EXCLUDE: stock market data, government policy, macroeconomics, large public corps with no startup angle.\n\n"
+        'If NOT a startup → output ONLY: {"isStartup":false}\n'
+        "If you cannot identify a specific real company name → output ONLY: {\"isStartup\":false}\n\n"
+        "If IS a startup → extract the main company. Output JSON only (no markdown, no explanation).\n"
+        "Example output:\n"
+        '{"isStartup":true,"companyName":"未來式智能","companyNameEn":"MindOS",'
+        '"description":"AI-powered digital employee platform for enterprise automation.",'
+        f'"summary":"{summary_ex}",'
+        '"industry":["AI","SaaS"],'
+        '"stage":"Pre-A","fundingAmountRaw":"數百萬美元",'
+        '"investors":["紅杉中國"],"founded":"2023","website":"",'
+        '"relevanceScore":7,"hotaiFitScore":6}\n\n'
+        "relevanceScore scale (0-10) — news quality:\n"
+        "  9-10: confirmed funding round with amount and investors named\n"
+        "  7-8:  confirmed funding round or product launch, some details\n"
+        "  5-6:  startup mentioned but funding/product unclear\n"
+        "  3-4:  tangentially related\n"
+        "  0-2:  irrelevant\n\n"
+        f"hotaiFitScore scale (0-10) — strategic fit for {_HOTAI_CONTEXT}\n"
+        "  9-10: core fit — EV/charging, MaaS/mobility, ADAS, auto InsurTech, auto finance\n"
+        "  7-8:  strong fit — AI/data platform, loyalty/payment, smart tourism, fleet management\n"
+        "  5-6:  adjacent fit — general InsurTech, FinTech, logistics, mobility-adjacent\n"
+        "  3-4:  weak fit — general SaaS/consumer tech\n"
+        "  0-2:  no clear strategic fit for Hotai\n\n"
+        f"Title: {title}\nSummary: {summary[:250]}"
+    )
+
+
 def _call_ollama_with_retry(prompt: str, max_retries: int = 3) -> dict | None:
     """call_ollama with exponential backoff on Timeout."""
     for attempt in range(1, max_retries + 1):
@@ -340,7 +397,7 @@ def call_ollama(prompt: str) -> dict | None:
         "format": "json",   # 強制 Ollama 輸出合法 JSON，大幅減少 parse 失敗
         "options": {
             "temperature": 0.05,
-            "num_predict": 600,   # 350 容易截斷含 relevanceScore 的完整輸出
+            "num_predict": 200,
             "top_p": 0.9,
             "repeat_penalty": 1.1,
         },
@@ -700,9 +757,64 @@ def collection_for_tab(tab_name: str) -> str:
     return today_collection()
 
 
+def _persist_startup(item: dict, result: dict, ws, col_ref: str, region: str) -> str:
+    """Validate, score, and persist a startup result to Firebase and Sheets.
+    Returns 'saved' or 'skipped'. Raises on unexpected errors (caller handles)."""
+    row_data  = item["data"]
+    url       = row_data[0] if len(row_data) > 0 else ""
+    source    = row_data[3] if len(row_data) > 3 else ""
+    prefilled = item.get("prefilled", {})
+
+    if not url:
+        logger.warning("   ⚠️  Row %d has no URL — marking skipped", item["row"])
+        ws.update_cell(item["row"], 7, "skipped")
+        return "skipped"
+
+    company = result.get("companyName", "")
+    if not _is_valid_company_name(company):
+        reason = f"placeholder name: '{company}'" if company else "no companyName"
+        logger.info("   ⚠️  Skip: %s", reason)
+        ws.update_cell(item["row"], 7, "skipped")
+        return "skipped"
+
+    if not result.get("stage") and prefilled.get("stage"):
+        result["stage"] = prefilled["stage"]
+    if not result.get("fundingAmountRaw") and prefilled.get("fundingAmountRaw"):
+        result["fundingAmountRaw"] = prefilled["fundingAmountRaw"]
+
+    result["isStartup"]        = True
+    result["region"]           = region
+    result["sourceId"]         = source
+    result["sourceUrl"]        = url
+    result["extractedAt"]      = datetime.now(timezone.utc).isoformat()
+    result["status"]           = "new"
+    result["fundingAmountUSD"] = normalize_funding(result.get("fundingAmountRaw", ""))
+    fd = calc_fit_score(result)
+
+    def _clamp(v: float) -> float:
+        return max(0.0, min(10.0, v))
+
+    result["fitScore"]      = _clamp(fd["fitScore"])
+    result["fitTags"]       = fd["fitTags"]
+    result["mlScore"]       = _clamp(fd["mlScore"])
+    result["ruleScore"]     = _clamp(fd["ruleScore"])
+    result["hotaiFitScore"] = _clamp(fd["hotaiFitScore"])
+    if fd["qwenScore"] is not None:
+        result["qwenScore"] = _clamp(fd["qwenScore"])
+    if fd["hotaiQwenScore"] is not None:
+        result["hotaiQwenScore"] = _clamp(fd["hotaiQwenScore"])
+
+    doc_id = hashlib.md5(url.encode()).hexdigest()[:16]
+    firestore_write(col_ref, result, doc_id=doc_id)
+    mirror_to_sheets(result)
+    ws.update_cell(item["row"], 7, "true")
+    logger.info("   ✅ %s [fit:%.1f hotai:%.1f]", company, result["fitScore"], result["hotaiFitScore"])
+    return "saved"
+
+
 # ── Main processor（三階段流程） ──
 
-BATCH_SIZE = 10  # Stage 1 每批多少篇
+BATCH_SIZE = 10  # Stage 1 每批多少篇（保留供參考，已不在主流程中使用）
 
 def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
     ws = get_sheet(tab_name)
@@ -784,41 +896,50 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
         logger.info("   ⏭️  Rule-skip: %d articles", len(to_skip))
         time.sleep(1)
 
-    # ── Stage 1：批次分類 ambiguous ──
-    if to_classify:
-        logger.info("Stage1: batch-classify %d ambiguous articles", len(to_classify))
-        for batch_start in range(0, len(to_classify), BATCH_SIZE):
-            chunk = to_classify[batch_start:batch_start + BATCH_SIZE]
-            try:
-                accepted_idx = batch_classify_titles(chunk)
-                for idx, item in enumerate(chunk):
-                    if idx in accepted_idx:
-                        to_extract.append(item)
-                    else:
-                        ws.update_cell(item["row"], 7, "true")
-                logger.info(
-                    "   Stage1 batch %d-%d: %d/%d accepted",
-                    batch_start, batch_start + len(chunk) - 1,
-                    len(accepted_idx), len(chunk)
-                )
-            except Exception as e:
-                logger.error("Stage1 batch error: %s — fallback to extract all", e)
-                to_extract.extend(chunk)
-            time.sleep(3)
-
-    # ── Stage 2：個別提取 ──
-    logger.info("Stage2: extract fields for %d confirmed startups", len(to_extract))
+    # ── Stage 1+2：ambiguous 文章合併分類＋提取（一次 LLM 呼叫） ──
     saved = skipped = errors = 0
+    stage1_2_accepted: list[tuple[dict, dict]] = []
+
+    if to_classify:
+        logger.info("Stage1+2: classify+extract %d ambiguous articles", len(to_classify))
+        rejected_rows_s1: list[int] = []
+        for j, item in enumerate(to_classify):
+            url = item["data"][0] if len(item["data"]) > 0 else ""
+            if not url:
+                rejected_rows_s1.append(item["row"])
+                continue
+            try:
+                logger.info("  🔎 [%d/%d] %s", j + 1, len(to_classify), item["title"][:60])
+                prompt = build_classify_and_extract_prompt(
+                    item["title"], item["summary"], item["prefilled"]
+                )
+                result = _call_ollama_with_retry(prompt)
+                if result is None or result.get("isStartup") is False:
+                    rejected_rows_s1.append(item["row"])
+                    logger.info("    ✗ not startup")
+                else:
+                    stage1_2_accepted.append((item, result))
+                    logger.info("    ✓ %s", result.get("companyName", "?")[:40])
+            except Exception as e:
+                logger.error("    ❌ Stage1+2 row %d: %s", item["row"], e)
+                ws.update_cell(item["row"], 7, "error")
+                errors += 1
+            time.sleep(3)
+        if rejected_rows_s1:
+            ws.batch_update([
+                {"range": f"G{r}", "values": [["true"]]} for r in rejected_rows_s1
+            ])
+        logger.info(
+            "Stage1+2 [%s]: accepted=%d rejected=%d",
+            region, len(stage1_2_accepted), len(rejected_rows_s1)
+        )
+
+    # ── Stage 2：Stage0 直接確認的 startup 提取欄位 ──
+    logger.info("Stage2: extract fields for %d Stage-0 confirmed startups", len(to_extract))
 
     for j, item in enumerate(to_extract):
-        row_data = item["data"]
-        url      = row_data[0] if len(row_data) > 0 else ""
-        source   = row_data[3] if len(row_data) > 3 else ""
-        title    = item["title"]
-        summary  = item["summary"]
-        prefilled = item["prefilled"]
+        url = item["data"][0] if len(item["data"]) > 0 else ""
 
-        # Input validation: skip rows with no URL (scraper output integrity check)
         if not url:
             logger.warning("   ⚠️  Row %d has no URL — marking skipped", item["row"])
             ws.update_cell(item["row"], 7, "skipped")
@@ -826,69 +947,46 @@ def process_raw_articles_by_region(region: str, tab_name: str) -> dict:
             continue
 
         try:
-            logger.info("🔍 [%d/%d] %s", j + 1, len(to_extract), title[:60])
-            prompt = build_extract_prompt(title, summary, url, prefilled)
-            result = _call_ollama_with_retry(prompt)  # retry wrapper with backoff
+            logger.info("🔍 [%d/%d] %s", j + 1, len(to_extract), item["title"][:60])
+            prompt = build_extract_prompt(item["title"], item["summary"], url, item["prefilled"])
+            result = _call_ollama_with_retry(prompt)
 
             if result is None:
-                # Ollama returned unparseable response after retries — flag for investigation
-                logger.warning("   ⚠️  Ollama parse failure for: %s", title[:60])
-                ws.update_cell(item["row"], 7, "error")  # Bug3 fix: "error" not "true"
+                logger.warning("   ⚠️  Ollama parse failure for: %s", item["title"][:60])
+                ws.update_cell(item["row"], 7, "error")
                 errors += 1
                 time.sleep(2)
                 continue
 
-            company = result.get("companyName", "")
-            if _is_valid_company_name(company):
-                # 補回 prefilled 欄位（Qwen 可能漏掉）
-                if not result.get("stage") and prefilled.get("stage"):
-                    result["stage"] = prefilled["stage"]
-                if not result.get("fundingAmountRaw") and prefilled.get("fundingAmountRaw"):
-                    result["fundingAmountRaw"] = prefilled["fundingAmountRaw"]
-
-                result["isStartup"]        = True
-                result["region"]           = region
-                result["sourceId"]         = source
-                result["sourceUrl"]        = url
-                result["extractedAt"]      = datetime.now(timezone.utc).isoformat()
-                result["status"]           = "new"
-                result["fundingAmountUSD"] = normalize_funding(result.get("fundingAmountRaw", ""))
-                fd = calc_fit_score(result)
-
-                def _clamp(v: float) -> float:
-                    return max(0.0, min(10.0, v))
-
-                result["fitScore"]       = _clamp(fd["fitScore"])
-                result["fitTags"]        = fd["fitTags"]
-                result["mlScore"]        = _clamp(fd["mlScore"])
-                result["ruleScore"]      = _clamp(fd["ruleScore"])
-                result["hotaiFitScore"]  = _clamp(fd["hotaiFitScore"])
-                if fd["qwenScore"] is not None:
-                    result["qwenScore"] = _clamp(fd["qwenScore"])
-                if fd["hotaiQwenScore"] is not None:
-                    result["hotaiQwenScore"] = _clamp(fd["hotaiQwenScore"])
-
-                # Idempotent write: URL hash as doc_id prevents duplicates on re-run
-                doc_id = hashlib.md5(url.encode()).hexdigest()[:16]
-                firestore_write(col_ref, result, doc_id=doc_id)
-                mirror_to_sheets(result)   # mirror scores to Sheets for human review
-                ws.update_cell(item["row"], 7, "true")
+            outcome = _persist_startup(item, result, ws, col_ref, region)
+            if outcome == "saved":
                 saved += 1
-                logger.info("   ✅ %s [fit:%.1f hotai:%.1f]", company, result["fitScore"], result["hotaiFitScore"])
             else:
-                # Valid JSON from Qwen but no identifiable company — expected for non-startups
-                reason = f"placeholder name: '{company}'" if company else "no companyName"
-                logger.info("   ⚠️  Skip: %s", reason)
-                ws.update_cell(item["row"], 7, "skipped")  # Bug3 fix: "skipped" not "true"
                 skipped += 1
-
-            time.sleep(3)
 
         except Exception as e:
             logger.error("   ❌ row %d: %s", item["row"], e)
             ws.update_cell(item["row"], 7, "error")
             errors += 1
             time.sleep(2)
+            continue
+
+        time.sleep(3)
+
+    # ── Stage1+2 accepted 儲存 ──
+    if stage1_2_accepted:
+        logger.info("Saving %d Stage1+2 accepted startups", len(stage1_2_accepted))
+    for item, result in stage1_2_accepted:
+        try:
+            outcome = _persist_startup(item, result, ws, col_ref, region)
+            if outcome == "saved":
+                saved += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            logger.error("   ❌ Stage1+2 save row %d: %s", item["row"], e)
+            ws.update_cell(item["row"], 7, "error")
+            errors += 1
 
     remaining = max(0, len(unprocessed) - region_limit)
     logger.info("📊 [%s] saved=%d skipped=%d errors=%d remaining=%d",
