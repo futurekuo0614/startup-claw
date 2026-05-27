@@ -639,17 +639,31 @@ def _make_summary_page(tab_name: str, stats: dict, hotai_docs: list[dict],
 </div>"""
 
 
+MIN_DISPLAY_GROUP_FIT = 1.8   # 低於此集團適配度的文章不顯示在報告中
+
 def _make_region_page(region: str, scored_map: dict) -> str:
     """Build a page from Firebase scored docs for this region only."""
-    docs = sorted(
-        [d for d in scored_map.values() if d.get("region") == region],
-        key=lambda d: (d.get("hotaiFitScore") or d.get("fitScore") or 0),
-        reverse=True,
-    )
+    all_docs = [d for d in scored_map.values() if d.get("region") == region]
+
+    # 顯示門檻：集團適配度 >= MIN_DISPLAY_GROUP_FIT
+    group_fit = lambda d: d.get("groupFitScore") or d.get("hotaiFitScore") or 0
+    docs = [d for d in all_docs if group_fit(d) >= MIN_DISPLAY_GROUP_FIT]
+
+    # 排序：有明確融資輪次或金額的優先，再按集團適配度降序
+    has_funding = lambda d: bool(d.get("stage") or d.get("fundingAmountRaw"))
+    docs = sorted(docs, key=lambda d: (has_funding(d), group_fit(d)), reverse=True)
+
+    filtered_out = len(all_docs) - len(docs)
+
     if not docs:
+        reason = (
+            f"本週尚無符合門檻（集團適配度 ≥ {MIN_DISPLAY_GROUP_FIT}）的已評分文章"
+            if all_docs else
+            "本週尚無已評分文章（請先執行 python main.py 完整流程）"
+        )
         return (f"<div class='region-page'>"
                 f"<div class='region-header'><h2>{_html.escape(region)} 新創投資情報</h2>"
-                f"<div class='sub'>本週尚無已評分文章（請先執行 python main.py 完整流程）</div></div></div>")
+                f"<div class='sub'>{reason}</div></div></div>")
 
     rows_html = ""
     for i, doc in enumerate(docs, 1):
@@ -700,7 +714,10 @@ def _make_region_page(region: str, scored_map: dict) -> str:
     return f"""<div class='region-page'>
   <div class='region-header'>
     <h2>{_html.escape(region)} 新創投資情報</h2>
-    <div class='sub'>AI 已評分 {len(docs)} 家新創 &nbsp;·&nbsp; 依和泰適配度排序</div>
+    <div class='sub'>
+      顯示 {len(docs)} 家（集團適配度 ≥ {MIN_DISPLAY_GROUP_FIT}，融資新聞優先）
+      {"&nbsp;·&nbsp; 已過濾 " + str(filtered_out) + " 筆低相關" if filtered_out else ""}
+    </div>
   </div>
   <div class='hotai-note'>集團適配度：40% Qwen語意 + 40% 業務關鍵字 + 20% 地區/輪次規則</div>
   <table class='dt'>
