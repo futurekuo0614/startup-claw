@@ -23,11 +23,15 @@ def ensure_ollama_running(timeout: int = 30) -> bool:
         pass
 
     logger.info("Ollama not running — starting ollama serve ...")
-    subprocess.Popen(
-        ["ollama", "serve"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        logger.error("Ollama binary not found — Ollama is not installed; skipping AI processing")
+        return False
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -52,7 +56,7 @@ def warm_up_ollama_model(timeout: int = 280) -> None:
         requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={"model": OLLAMA_MODEL, "prompt": "Hi", "stream": False,
-                  "options": {"num_predict": 1}},
+                  "think": False, "options": {"num_predict": 1}},
             timeout=timeout,
         )
         logger.info("Ollama model warmed up (%.1fs)", time.time() - start)

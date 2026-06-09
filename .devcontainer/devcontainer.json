@@ -1,0 +1,4 @@
+{
+  "name": "startup-claw",
+  "postStartCommand": "bash ${containerWorkspaceFolder}/.devcontainer/poststart.sh"
+}

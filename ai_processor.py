@@ -19,7 +19,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapi
 TAIWAN_DOMAINS = ["meet.bnext", "bnext.com", "inside.com.tw", "technews.tw", "news.google.com", "ctee.com.tw", "udn.com"]
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "qwen2.5:7b"
+OLLAMA_MODEL = "qwen3:8b"
 
 # ── 和泰相關性最低門檻：Qwen 評分 < 此值的文章不寫入 Firebase ──
 # 調高此值可讓 Firebase 更乾淨；調低可保留較多邊緣文章
@@ -219,6 +219,7 @@ def _call_ollama_raw(prompt: str, num_predict: int = 80) -> str:
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "options": {"temperature": 0.0, "num_predict": num_predict},
     }
     resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=200)
@@ -416,6 +417,7 @@ def call_ollama(prompt: str) -> dict | None:
         "prompt": prompt,
         "stream": False,
         "format": "json",   # 強制 Ollama 輸出合法 JSON，大幅減少 parse 失敗
+        "think": False,
         "options": {
             "temperature": 0.05,
             "num_predict": 200,
